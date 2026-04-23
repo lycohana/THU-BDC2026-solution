@@ -19,10 +19,24 @@ wheels/
 
 *.tar
 
+# Baseline-only docs/assets and raw downloaded data
+asset/
+GUIDE.md
+get_stock_data.py
+get_stock_data_illustration.txt
+data/stock_data.csv
+data/hs300_stock_list.csv
+
 # Training artifacts
-model/
-output/
-temp/
+/model/
+/output/
+/temp/
+test/output/*
+!test/output/.gitkeep
+test/results_output/*
+!test/results_output/.gitkeep
+test/tars/*
+!test/tars/.gitkeep
 *.pth
 *.pkl
 *.ckpt

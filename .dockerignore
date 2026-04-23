@@ -4,3 +4,10 @@ __pycache__
 .venv
 .vscode
 .idea
+asset
+model
+output
+temp
+test/output
+test/results_output
+test/tars
