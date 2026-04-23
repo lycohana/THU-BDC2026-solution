@@ -1,5 +1,6 @@
 import json
 import os
+import warnings
 
 import joblib
 import numpy as np
@@ -177,8 +178,10 @@ def predict_lgb_score(lgb_bundle, feature_df, cfg):
     lgb_cfg = cfg.get('lgb', {})
     feature_cols = lgb_bundle['features']
     X = _clean_feature_frame(feature_df, feature_cols)
-    rank_score = lgb_bundle['ranker'].predict(X)
-    reg_score = lgb_bundle['regressor'].predict(X)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message="Found 'eval_at' in params.*")
+        rank_score = lgb_bundle['ranker'].predict(X)
+        reg_score = lgb_bundle['regressor'].predict(X)
     return (
         lgb_cfg.get('rank_weight', 0.65) * _zscore(rank_score)
         + lgb_cfg.get('reg_weight', 0.35) * _zscore(reg_score)

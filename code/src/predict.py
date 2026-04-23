@@ -64,7 +64,7 @@ def preprocess_predict_data(df, stockid2idx):
 		raise ValueError('输入数据为空，无法预测')
 
 	num_processes = min(10, mp.cpu_count())
-	print('cpus!!!!!!!!!!!!!!!!!!',mp.cpu_count())
+	print(f'[BDC][predict] cpu_count={mp.cpu_count()}, feature_workers={num_processes}')
 	with mp.Pool(processes=num_processes) as pool:
 		processed_list = list(tqdm(pool.imap(feature_engineer, groups), total=len(groups), desc='预测集特征工程'))
 
@@ -126,6 +126,35 @@ def optimize_weights(candidates, score_col='score', risk_col='sigma20', tau=0.4,
 	weights = raw_weight / (raw_weight.sum() + 1e-12) * exposure_cap
 	out = candidates[['stock_id']].copy()
 	out['weight'] = np.round(weights, 6)
+	return out
+
+
+def select_candidates(score_df):
+	post_cfg = config.get('postprocess', {})
+	filter_name = post_cfg.get('filter', 'stable')
+	liquidity_q = post_cfg.get('liquidity_quantile', 0.20)
+	sigma_q = post_cfg.get('sigma_quantile', 0.85)
+
+	filtered = score_df.copy()
+	if filter_name in ('liquidity80', 'stable'):
+		liquidity_floor = filtered['median_amount20'].quantile(liquidity_q)
+		liquid = filtered[filtered['median_amount20'] >= liquidity_floor].copy()
+		if len(liquid) >= 5:
+			filtered = liquid
+
+	if filter_name == 'stable':
+		sigma_cap = filtered['sigma20'].quantile(sigma_q)
+		stable = filtered[filtered['sigma20'] <= sigma_cap].copy()
+		if len(stable) >= 5:
+			filtered = stable
+
+	return filtered.sort_values('score', ascending=False).reset_index(drop=True)
+
+
+def equal_weights(candidates, exposure_cap=1.0, k=5):
+	top = candidates.head(k).copy()
+	out = top[['stock_id']].copy()
+	out['weight'] = np.round(exposure_cap / len(top), 6)
 	return out
 
 
@@ -210,11 +239,7 @@ def main():
 	score_df['sigma20'] = score_df['sigma20'].fillna(score_df['sigma20'].median()).clip(lower=1e-4)
 	score_df['median_amount20'] = score_df['median_amount20'].fillna(0.0)
 
-	liquidity_floor = score_df['median_amount20'].quantile(0.20)
-	filtered = score_df[score_df['median_amount20'] >= liquidity_floor].copy()
-	if len(filtered) < 5:
-		filtered = score_df.copy()
-	filtered = filtered.sort_values('score', ascending=False).reset_index(drop=True)
+	filtered = select_candidates(score_df)
 
 	if len(filtered) < 5:
 		raise ValueError(f'可预测股票不足5只，当前仅有 {len(filtered)} 只')
@@ -222,14 +247,19 @@ def main():
 	latest_processed = processed[processed['日期'] == latest_date]
 	breadth = latest_processed['return_1'].gt(0).mean() if 'return_1' in latest_processed.columns else 1.0
 	exposure_cap = 0.7 if breadth < 0.30 else 1.0
-	output_df = optimize_weights(filtered.head(5), exposure_cap=exposure_cap)
+	post_cfg = config.get('postprocess', {})
+	if post_cfg.get('weighting', 'equal') == 'equal':
+		output_df = equal_weights(filtered, exposure_cap=exposure_cap)
+	else:
+		output_df = optimize_weights(filtered.head(5), exposure_cap=exposure_cap)
 	output_df.to_csv(output_path, index=False)
 
-	print(f'预测日期: {latest_date.date()}')
-	print(f'参与排序股票数: {len(score_df)}')
-	print(f'分数来源: {score_source}')
-	print(f'最终仓位: {output_df["weight"].sum():.4f}')
-	print(f'结果已写入: {output_path}')
+	print(f'[BDC][predict] date={latest_date.date()}')
+	print(f'[BDC][predict] ranked_stocks={len(score_df)}')
+	print(f'[BDC][predict] score_source={score_source}')
+	print(f'[BDC][predict] postprocess=filter:{post_cfg.get("filter", "stable")}, weighting:{post_cfg.get("weighting", "equal")}')
+	print(f'[BDC][predict] exposure={output_df["weight"].sum():.4f}')
+	print(f'[BDC][predict] output={output_path}')
 
 
 if __name__ == '__main__':

@@ -6,11 +6,18 @@
 
 ## 当前状态
 
-当前阶段：`Phase 2 已完成代码接入，但本地 holdout 低于基准，需要先修融合/后处理`
+当前阶段：`Phase 2 合法组合层验证已完成，待写入正式推理配置`
 
 当前主线：`Phase 1 稳固 baseline` -> `Phase 2 LightGBM 稳分分支` -> `Phase 3 GraphFormer 增量分支` -> `Phase 4 OOF 融合与提交优化`
 
-下一步：先让 Phase 2 的 `score_self.py` 不低于基准，再进入 GraphFormer 动态相关图分支。
+下一步：将 exp-002-03 的合法验证配置写入正式 `predict.py`，再只用 `test.csv` 做一次最终本地评测。
+
+## 数据边界硬规则
+
+- `data/train.csv`：允许训练、切验证集、walk-forward、OOF、调参、选择融合权重、选择过滤阈值。
+- `data/test.csv`：只允许最终运行 `uv run python test/score_self.py` 做一次本地评测；不能用于训练、调参、融合权重搜索、阈值选择、模型选择或候选选择。
+- `output/result.csv`：只能由已经固定好的训练/推理规则生成；不能因为看过 `test.csv` 的收益而手动改股票或权重。
+- 所有 Todo/实验表中，凡是用了 `test.csv` 做调参的记录都必须标记为 `Invalid`，不能作为方案依据。
 
 ## 阶段总览
 
@@ -18,7 +25,7 @@
 |---|---|---|---|---|---|
 | Phase 0 | Done | 复制 baseline，新建独立仓库 | `THU-BDC2026-solution/` | 仓库可运行 | 保留 baseline 只作对照 |
 | Phase 1 | Done | 修样本口径、加横截面特征、补赛事入口、改推理权重 | `best_model.pth`、`scaler.pkl`、`final_score.txt`、`result.csv` | `final_score=0.037838` | 作为 Phase 2 对照基线 |
-| Phase 2 | Needs Fix | 加入 LightGBM Ranker + Regressor 稳分分支 | `lgb_ranker.pkl`、`lgb_regressor.pkl`、`lgb_features.json`、`lgb_report.json` | `transformer_final=0.055197`, `lgb_valid=0.279713`, `score_self=0.004426`, 低于基准 `0.025179` | 先调融合/后处理 |
+| Phase 2 | Done | 加入 LightGBM Ranker + Regressor，并完成合法组合层验证和正式推理评测 | `lgb_ranker.pkl`、`lgb_regressor.pkl`、`lgb_features.json`、`lgb_report.json`、`exp_002_03_validation_combo_grid.csv` | exp-002-03: `validation_mean_return=0.027449`, `score_self=0.057577` | 作为下一阶段对照 |
 | Phase 3 | Todo | 将 dense CrossStockAttention 升级为动态图 GraphFormer | `graphformer_*.pth`、图配置、验证报告 | 待填写 | Phase 2 稳定后开始 |
 | Phase 4 | Todo | walk-forward OOF、融合权重搜索、相关性去重、最终提交优化 | `oof_predictions.*`、`blend_config.json`、最终 `result.csv` | 待填写 | Phase 3 后开始 |
 | Phase 5 | Todo | Docker 复现、镜像导出、提交前检查 | `team_name.tar`、Docker 复现日志 | 待填写 | 最终提交前完成 |
@@ -37,7 +44,9 @@
 | exp-001 | 2026-04-23 | Phase 1 | `uv run python app/code/src/train.py` | `uv run python app/code/src/test.py` | `best_epoch=10`, `final_score=0.037838` | 空 | `600023/601668/601018/601818/601186`, 等权 `0.2` | Phase 1 对照基线 |
 | baseline-main | 2026-04-23 | Baseline | 基准已有产物 | `uv run python test/score_self.py` | 原始基准输出 | `0.02517949121691857` | `600023/601668/601018/601818/601186`, 等权 `0.2` | `THU-BDC2026-main` 重算确认 |
 | exp-002 | 2026-04-23 | Phase 2 | `uv run python app/code/src/train.py` | `uv run python app/code/src/test.py` | `best_epoch=21`, `transformer_final=0.055197`, `lgb_valid=0.279713` | `0.0044263938292461585` | `300502/600489/300308/603993/300394`, 等权 `0.2` | 低于基准，需修融合 |
-| exp-002-02 | 2026-04-23 | Phase 2 消融 | 不重训 | `uv run python code/src/experiment_blend.py` | 扫融合权重和后处理 | 最优 `0.014451` | `300502/600489/688008/300394/300308`, 等权 `0.2` | `Transformer 0.40 / LGBM 0.60`, 仍低于外部对照线 |
+| exp-002-02 | 2026-04-23 | Invalid | 不重训 | 旧版 `experiment_blend.py` | 使用了 `data/test.csv` 扫融合权重和后处理 | `0.014451` | `300502/600489/688008/300394/300308`, 等权 `0.2` | 泄漏诊断，仅用于发现问题，不能作为方案依据 |
+| exp-002-03 | 2026-04-23 | Phase 2 组合层 | 不重训 | `uv run python code/src/experiment_blend.py --mode validation` | 仅使用 `train.csv` 内部验证段 | `validation_mean_return=0.027449` | 验证末日 `40/163/158/239/293`, 等权 `0.2` | `Transformer 0.30 / LGBM 0.70 + stable filter + equal weight` |
+| exp-002-03-final | 2026-04-23 | Phase 2 正式推理 | 不重训 | `uv run python app/code/src/test.py` | 固定 exp-002-03 配置后只做最终本地评测 | `0.05757693442603892` | `601899/603799/002384/600362/002463`, 等权 `0.2` | 正式 `predict.py`: `Transformer 0.30 / LGBM 0.70 + stable + equal` |
 | exp-003 | 待填写 | Phase 3 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | GraphFormer |
 | exp-004 | 待填写 | Phase 4 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | OOF 融合 |
 
@@ -76,13 +85,36 @@ stock_id,weight
 300394,0.2
 ```
 
-Phase 2 消融结论：
+Phase 2 消融备注：
 
 - 当前默认融合 `Transformer 0.55 / LGBM 0.45` 的本地分数是 `0.0044263938292461585`。
-- 不重训只扫融合权重后，当前最优为 `Transformer 0.40 / LGBM 0.60`，本地分数 `0.014451`。
-- 消融最优组合仍低于外部对照线 `0.02517949121691857`，所以 Phase 2 不能直接作为最终稳分方案。
+- 旧版 exp-002-02 曾用 `data/test.csv` 扫融合权重，属于测试集泄漏，只能作为问题诊断，不能用于选配置。
 - `risk_soft` 经常退化成等权，原因是 `cap=0.35` 截断后再归一化，Top5 权重容易全部变成 `0.2`。
 - 当前问题重点不是训练是否跑通，而是验证代理、融合权重和组合后处理与最终 `score_self.py` 目标不一致。
+- 合法 exp-002-03 只使用 `train.csv` 内部验证段，当前最优配置为 `Transformer 0.30 / LGBM 0.70 + stable filter + equal weight`，验证段平均组合收益 `0.027449`。这可以作为下一次正式推理配置候选，但仍需先讨论是否直接写入 `predict.py`。
+
+Phase 2 exp-002-03 固定候选配置：
+
+```text
+blend.transformer_weight = 0.30
+blend.lgb_weight = 0.70
+postprocess.filter = stable
+postprocess.weighting = equal
+validation_metric = mean daily top5 weighted return
+validation_mean_return = 0.027449
+data_boundary = train.csv internal validation only
+```
+
+Phase 2 exp-002-03-final `result.csv` 快照：
+
+```csv
+stock_id,weight
+601899,0.2
+603799,0.2
+002384,0.2
+600362,0.2
+002463,0.2
+```
 
 ## Todo 清单
 
@@ -108,11 +140,15 @@ Phase 2 消融结论：
 - [x] 完整推理，确认日志显示 `分数来源: transformer+lgb(...)`。
 - [x] 运行 `uv run python test/score_self.py`。
 - [x] 将 Phase 2 分数和 `result.csv` 补进实验记录表。
-- [ ] 调整融合权重或增加候选回退，使 `score_self.py` 不低于基准 `0.02517949121691857`。
-- [ ] 检查权重优化被 `cap=0.35` 全部截断导致最终等权的问题。
+- [x] 只使用训练集内部验证段调整融合权重和后处理。
+- [x] 检查权重优化被 `cap=0.35` 全部截断导致最终等权的问题。
 - [x] 新增 `code/src/experiment_blend.py`，用于不重训扫描融合权重和后处理。
-- [x] 完成 exp-002-02 消融，当前最优 `0.014451`。
-- [ ] 重新设计组合权重，避免 `risk_soft` 退化为等权。
+- [x] 将旧 exp-002-02 标记为 Invalid，因为它使用了 `data/test.csv` 调参。
+- [x] 完成合法 exp-002-03：只使用 `train.csv` 内部验证段搜索组合层。
+- [x] 暂停使用不稳定的 `risk_soft`，exp-002-03 暂定等权。
+- [x] 将 exp-002-03 的最优验证配置写入正式 `predict.py`。
+- [x] 运行最终本地评测，`score_self.py=0.05757693442603892`。
+- [x] 给 `predict.py`、`score_self.py`、`experiment_blend.py` 输出增加 `[BDC]` 标号。
 
 ### Phase 3：GraphFormer 增量分支
 

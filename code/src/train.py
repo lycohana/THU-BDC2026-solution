@@ -46,10 +46,10 @@ def _build_label_and_clean(processed, drop_small_open=True):
 
     # 过滤无效开盘价，避免收益率极端爆炸
     if drop_small_open:
-        processed = processed[processed['open_t1'] > 1e-4]
+        processed = processed[processed['open_t1'] > 1e-4].copy()
 
     processed['label'] = (processed['open_t5'] - processed['open_t1']) / (processed['open_t1'] + 1e-12)
-    processed = processed.dropna(subset=['label'])
+    processed = processed.dropna(subset=['label']).copy()
 
     processed.drop(columns=['open_t1', 'open_t5'], inplace=True)
     return processed

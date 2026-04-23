@@ -89,4 +89,4 @@ result = pd.DataFrame(
     }
 )
 result.to_csv("./temp/tmp.csv", index=False)
-print(f"预测股票的加权收益率得分: {predict_weight_score}")
+print(f"[BDC][score_self] final_score={predict_weight_score}")

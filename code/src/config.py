@@ -24,8 +24,14 @@ config = {
     'val_ranking_data_path': f'./temp/val_ranking_{sequence_length}_{feature_num}_cs.pkl',
     'train_lgb': True,
     'blend': {
-        'transformer_weight': 0.55,
-        'lgb_weight': 0.45,
+        'transformer_weight': 0.30,
+        'lgb_weight': 0.70,
+    },
+    'postprocess': {
+        'filter': 'stable',
+        'weighting': 'equal',
+        'liquidity_quantile': 0.20,
+        'sigma_quantile': 0.85,
     },
     'lgb': {
         'rank_weight': 0.65,
