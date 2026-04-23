@@ -1,7 +1,9 @@
 # 配置参数
 sequence_length = 60
 feature_num = '158+39'
+experiment_name = 'exp-002-05'
 config = {
+    'experiment_name': experiment_name,
     'sequence_length': sequence_length,   # 使用过去 60 个交易日的数据（排序任务可以用稍短的序列）
     'd_model': 256,          # Transformer 输入维度
     'nhead': 4,             # 注意力头数量
@@ -18,10 +20,10 @@ config = {
     'base_weight': 1.0, # 非 top-k 样本权重
     'top5_weight': 2.0, # top-5 样本权重（应大于 base_weight）
 
-    'output_dir': f'./model/{sequence_length}_{feature_num}',
+    'output_dir': f'./model/{experiment_name}_{sequence_length}_{feature_num}',
     'data_path': './data',
-    'train_ranking_data_path': f'./temp/train_ranking_{sequence_length}_{feature_num}_cs.pkl',
-    'val_ranking_data_path': f'./temp/val_ranking_{sequence_length}_{feature_num}_cs.pkl',
+    'train_ranking_data_path': f'./temp/{experiment_name}_train_ranking_{sequence_length}_{feature_num}_cs.pkl',
+    'val_ranking_data_path': f'./temp/{experiment_name}_val_ranking_{sequence_length}_{feature_num}_cs.pkl',
     'train_lgb': True,
     'blend': {
         'transformer_weight': 0.30,

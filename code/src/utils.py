@@ -6,9 +6,11 @@ from tqdm import tqdm
 
 CORE_CS_COLS = [
     'return_1', 'return_5', 'return_10',
+    'ret3', 'ret7', 'ret15',
     'volatility_10', 'volatility_20',
     '换手率', '成交额', '成交量', '涨跌幅', '振幅',
     'rsi', 'macd', 'kdj_j', 'boll_std', 'volume_ratio', 'atr_14',
+    'amount_rel', 'amount_rel_ma', 'alpha_rel',
     'KMID', 'KLEN', 'ROC5', 'ROC10', 'STD10', 'STD20', 'CORR20', 'CORD20',
 ]
 

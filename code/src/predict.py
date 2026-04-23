@@ -8,54 +8,15 @@ import torch
 from tqdm import tqdm
 
 from config import config
+from feature_registry import finalize_feature_frame, get_feature_columns, get_feature_engineer
 from lgb_branch import load_lgb_branches, predict_lgb_score
 from model import StockTransformer
-from utils import engineer_features_39, engineer_features_158plus39
-from utils import add_cross_section_features, extend_feature_columns_with_cross_section
-
-
-feature_cloums_map = {
-	'39': [
-		'instrument', '开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅',
-		'sma_5', 'sma_20', 'ema_12', 'ema_26', 'rsi', 'macd', 'macd_signal', 'volume_change', 'obv',
-		'volume_ma_5', 'volume_ma_20', 'volume_ratio', 'kdj_k', 'kdj_d', 'kdj_j', 'boll_mid', 'boll_std',
-		'atr_14', 'ema_60', 'volatility_10', 'volatility_20', 'return_1', 'return_5', 'return_10',
-		'high_low_spread', 'open_close_spread', 'high_close_spread', 'low_close_spread'
-	],
-	'158+39': [
-		'instrument', '开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅',
-		'KMID', 'KLEN', 'KMID2', 'KUP', 'KUP2', 'KLOW', 'KLOW2', 'KSFT', 'KSFT2', 'OPEN0', 'HIGH0', 'LOW0',
-		'VWAP0', 'ROC5', 'ROC10', 'ROC20', 'ROC30', 'ROC60', 'MA5', 'MA10', 'MA20', 'MA30', 'MA60', 'STD5',
-		'STD10', 'STD20', 'STD30', 'STD60', 'BETA5', 'BETA10', 'BETA20', 'BETA30', 'BETA60', 'RSQR5', 'RSQR10',
-		'RSQR20', 'RSQR30', 'RSQR60', 'RESI5', 'RESI10', 'RESI20', 'RESI30', 'RESI60', 'MAX5', 'MAX10', 'MAX20',
-		'MAX30', 'MAX60', 'MIN5', 'MIN10', 'MIN20', 'MIN30', 'MIN60', 'QTLU5', 'QTLU10', 'QTLU20', 'QTLU30',
-		'QTLU60', 'QTLD5', 'QTLD10', 'QTLD20', 'QTLD30', 'QTLD60', 'RANK5', 'RANK10', 'RANK20', 'RANK30',
-		'RANK60', 'RSV5', 'RSV10', 'RSV20', 'RSV30', 'RSV60', 'IMAX5', 'IMAX10', 'IMAX20', 'IMAX30', 'IMAX60',
-		'IMIN5', 'IMIN10', 'IMIN20', 'IMIN30', 'IMIN60', 'IMXD5', 'IMXD10', 'IMXD20', 'IMXD30', 'IMXD60',
-		'CORR5', 'CORR10', 'CORR20', 'CORR30', 'CORR60', 'CORD5', 'CORD10', 'CORD20', 'CORD30', 'CORD60',
-		'CNTP5', 'CNTP10', 'CNTP20', 'CNTP30', 'CNTP60', 'CNTN5', 'CNTN10', 'CNTN20', 'CNTN30', 'CNTN60',
-		'CNTD5', 'CNTD10', 'CNTD20', 'CNTD30', 'CNTD60', 'SUMP5', 'SUMP10', 'SUMP20', 'SUMP30', 'SUMP60',
-		'SUMN5', 'SUMN10', 'SUMN20', 'SUMN30', 'SUMN60', 'SUMD5', 'SUMD10', 'SUMD20', 'SUMD30', 'SUMD60',
-		'VMA5', 'VMA10', 'VMA20', 'VMA30', 'VMA60', 'VSTD5', 'VSTD10', 'VSTD20', 'VSTD30', 'VSTD60', 'WVMA5',
-		'WVMA10', 'WVMA20', 'WVMA30', 'WVMA60', 'VSUMP5', 'VSUMP10', 'VSUMP20', 'VSUMP30', 'VSUMP60', 'VSUMN5',
-		'VSUMN10', 'VSUMN20', 'VSUMN30', 'VSUMN60', 'VSUMD5', 'VSUMD10', 'VSUMD20', 'VSUMD30', 'VSUMD60',
-		'sma_5', 'sma_20', 'ema_12', 'ema_26', 'rsi', 'macd', 'macd_signal', 'volume_change', 'obv',
-		'volume_ma_5', 'volume_ma_20', 'volume_ratio', 'kdj_k', 'kdj_d', 'kdj_j', 'boll_mid', 'boll_std',
-		'atr_14', 'ema_60', 'volatility_10', 'volatility_20', 'return_1', 'return_5', 'return_10',
-		'high_low_spread', 'open_close_spread', 'high_close_spread', 'low_close_spread'
-	]
-}
-
-feature_engineer_func_map = {
-	'39': engineer_features_39,
-	'158+39': engineer_features_158plus39,
-}
+from portfolio_utils import build_weight_portfolio, select_candidates as shared_select_candidates
 
 
 def preprocess_predict_data(df, stockid2idx):
-	assert config['feature_num'] in feature_engineer_func_map, f"Unsupported feature_num: {config['feature_num']}"
-	feature_engineer = feature_engineer_func_map[config['feature_num']]
-	feature_columns = feature_cloums_map[config['feature_num']]
+	feature_engineer = get_feature_engineer(config['feature_num'])
+	feature_columns = get_feature_columns(config['feature_num'])
 
 	df = df.copy()
 	df = df.sort_values(['股票代码', '日期']).reset_index(drop=True)
@@ -73,8 +34,15 @@ def preprocess_predict_data(df, stockid2idx):
 	processed = processed.dropna(subset=['instrument']).copy()
 	processed['instrument'] = processed['instrument'].astype(np.int64)
 	processed['日期'] = pd.to_datetime(processed['日期'])
-	processed = add_cross_section_features(processed, date_col='日期')
-	feature_columns = extend_feature_columns_with_cross_section(feature_columns, processed)
+	enhance_cfg = config.get('feature_enhance', {})
+	if any(enhance_cfg.values()):
+		print(f'[BDC][feature_enhance] 启用预测特征增强：{enhance_cfg}')
+	processed, feature_columns = finalize_feature_frame(
+		processed,
+		feature_columns,
+		enhance_cfg=enhance_cfg,
+		date_col='日期',
+	)
 
 	return processed, feature_columns
 
@@ -106,12 +74,18 @@ def build_risk_frame(raw_df, stock_ids, latest_date):
 		].sort_values('日期').tail(21)
 		if len(hist) < 2:
 			continue
-		ret = hist['收盘'].astype(float).pct_change().dropna()
+		close = hist['收盘'].astype(float)
+		high = hist['最高'].astype(float)
+		low = hist['最低'].astype(float)
+		ret = close.pct_change(fill_method=None).dropna()
 		amount = hist['成交额'].astype(float)
 		rows.append({
 			'stock_id': stock_id,
 			'sigma20': float(ret.std()) if len(ret) > 1 else 0.0,
 			'median_amount20': float(amount.median()) if len(amount) else 0.0,
+			'ret5': float(close.iloc[-1] / close.iloc[-6] - 1.0) if len(close) >= 6 else 0.0,
+			'ret20': float(close.iloc[-1] / close.iloc[0] - 1.0) if len(close) >= 2 else 0.0,
+			'amp20': float((high.max() - low.min()) / (close.iloc[-1] + 1e-12)),
 		})
 	return pd.DataFrame(rows)
 
@@ -161,58 +135,7 @@ def score_soft_weights(candidates, k=5, tau=1.0, max_weight=0.50, min_weight=0.0
 
 
 def select_candidates(score_df):
-	"""
-	扩展过滤策略：支持 stable, liquidity80, no_extreme_momentum, consensus, consensus_stable
-	"""
-	post_cfg = config.get('postprocess', {})
-	filter_name = post_cfg.get('filter', 'stable')
-	liquidity_q = post_cfg.get('liquidity_quantile', 0.20)
-	sigma_q = post_cfg.get('sigma_quantile', 0.85)
-
-	filtered = score_df.copy()
-
-	# 流动性过滤
-	if filter_name in ('liquidity80', 'stable', 'no_extreme_momentum', 'consensus_stable'):
-		liquidity_floor = filtered['median_amount20'].quantile(liquidity_q)
-		liquid = filtered[filtered['median_amount20'] >= liquidity_floor].copy()
-		if len(liquid) >= 5:
-			filtered = liquid
-
-	# 波动率过滤
-	if filter_name in ('stable', 'no_extreme_momentum', 'consensus_stable'):
-		sigma_cap = filtered['sigma20'].quantile(sigma_q)
-		stable = filtered[filtered['sigma20'] <= sigma_cap].copy()
-		if len(stable) >= 5:
-			filtered = stable
-
-	# 极端动量过滤
-	if filter_name == 'no_extreme_momentum':
-		ret5_low = filtered['ret5'].quantile(0.10)
-		ret5_high = filtered['ret5'].quantile(0.90)
-		amp_cap = filtered['amp20'].quantile(0.90)
-		momentum_filtered = filtered[
-			(filtered['ret5'] >= ret5_low)
-			& (filtered['ret5'] <= ret5_high)
-			& (filtered['amp20'] <= amp_cap)
-		].copy()
-		if len(momentum_filtered) >= 5:
-			filtered = momentum_filtered
-
-	# 共识过滤
-	if filter_name in ('consensus', 'consensus_stable'):
-		filtered = filtered.copy()
-		filtered['transformer_rank'] = filtered['transformer'].rank(ascending=False, method='first')
-		filtered['lgb_rank'] = filtered['lgb'].rank(ascending=False, method='first')
-		for cutoff in (30, 50, 80, 120):
-			consensus = filtered[
-				(filtered['transformer_rank'] <= cutoff)
-				& (filtered['lgb_rank'] <= cutoff)
-			].copy()
-			if len(consensus) >= 5:
-				filtered = consensus
-				break
-
-	return filtered.sort_values('score', ascending=False).reset_index(drop=True)
+	return shared_select_candidates(score_df, post_cfg=config.get('postprocess', {}))
 
 
 def select_weighting_func(weighting_name):
@@ -308,11 +231,15 @@ def main():
 	score_df = pd.DataFrame({
 		'stock_id': sequence_stock_ids,
 		'score': scores,
+		'transformer': transformer_scores,
+		'lgb': np.asarray(lgb_scores, dtype=np.float64) if lgb_scores is not None else np.full(len(sequence_stock_ids), np.nan),
 	})
 	risk_df = build_risk_frame(raw_df, sequence_stock_ids, latest_date)
 	score_df = score_df.merge(risk_df, on='stock_id', how='left')
 	score_df['sigma20'] = score_df['sigma20'].fillna(score_df['sigma20'].median()).clip(lower=1e-4)
 	score_df['median_amount20'] = score_df['median_amount20'].fillna(0.0)
+	for col in ['ret5', 'ret20', 'amp20']:
+		score_df[col] = score_df[col].fillna(score_df[col].median() if score_df[col].notna().any() else 0.0)
 
 	filtered = select_candidates(score_df)
 
@@ -324,13 +251,7 @@ def main():
 	exposure_cap = 0.7 if breadth < 0.30 else 1.0
 	post_cfg = config.get('postprocess', {})
 	weighting_name = post_cfg.get('weighting', 'equal')
-
-	# 使用统一的权重函数选择器
-	weighting_func = select_weighting_func(weighting_name)
-	output_df = weighting_func(filtered)
-
-	# 应用 exposure cap
-	output_df['weight'] = output_df['weight'] * exposure_cap
+	output_df = build_weight_portfolio(filtered, weighting_name, exposure_cap=exposure_cap)
 	output_df.to_csv(output_path, index=False)
 
 	print(f'[BDC][predict] date={latest_date.date()}')

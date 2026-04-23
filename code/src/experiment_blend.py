@@ -19,6 +19,7 @@ if str(ROOT / 'code' / 'src') not in sys.path:
 from config import config
 from lgb_branch import load_lgb_branches, predict_lgb_score
 from model import StockTransformer
+from portfolio_utils import apply_filter, build_weight_portfolio, weights_df_to_selection
 from train import preprocess_val_data, split_train_val_by_last_month
 from predict import zscore
 
@@ -459,6 +460,9 @@ def run_oof_grid(n_folds=4, weights=None, penalties=None, output_path='temp/oof_
 def _run_grid_on_fold(score_df, weights, penalties, fold_idx):
     """在单个折上运行网格搜索"""
     rows = []
+    post_cfg = config.get('postprocess', {})
+    filter_names = ['nofilter', 'liquidity80', 'stable', 'no_extreme_momentum', 'consensus', 'consensus_stable', 'topk10']
+    weighting_names = ['equal', 'risk_soft', 'score_soft', 'score_risk_soft', 'inv_vol']
 
     for transformer_weight in weights:
         lgb_weight = 1.0 - transformer_weight
@@ -473,26 +477,17 @@ def _run_grid_on_fold(score_df, weights, penalties, fold_idx):
 
             daily_scores = []
             for date, day_base in base.groupby('date', sort=True):
-                filter_options = [
-                    ('nofilter', day_base),
-                    ('liquidity80', current_filter(day_base)),
-                    ('stable', stable_filter(day_base)),
-                    ('no_extreme_momentum', no_extreme_momentum_filter(day_base)),
-                    ('consensus', consensus_filter(day_base)),
-                    ('consensus_stable', consensus_stable_filter(day_base)),
-                    ('topk10', topk_filter(day_base, k=10)),
-                ]
-                selector_options = [
-                    ('equal', equal_topk),
-                    ('risk_soft', risk_soft_topk),
-                    ('score_soft', score_soft_topk),
-                    ('score_risk_soft', score_risk_soft_topk),
-                    ('inv_vol', inv_vol_topk),
-                ]
-                for filter_name, filtered in filter_options:
-                    for weight_name, selector in selector_options:
+                for filter_name in filter_names:
+                    filtered = apply_filter(
+                        day_base,
+                        filter_name,
+                        liquidity_quantile=post_cfg.get('liquidity_quantile', 0.20),
+                        sigma_quantile=post_cfg.get('sigma_quantile', 0.85),
+                    )
+                    for weight_name in weighting_names:
                         try:
-                            selected = selector(filtered)
+                            weights_df = build_weight_portfolio(filtered, weight_name)
+                            selected = weights_df_to_selection(weights_df)
                             score, _ = score_portfolio(day_base, selected)
                             daily_scores.append({
                                 'key': (filter_name, weight_name),
@@ -695,6 +690,9 @@ def run_single_val_grid(weights, output_path, penalties):
     score_df = load_validation_scores()
     rows = []
     details = []
+    post_cfg = config.get('postprocess', {})
+    filter_names = ['nofilter', 'liquidity80', 'stable', 'no_extreme_momentum', 'consensus', 'consensus_stable']
+    weighting_names = ['equal', 'risk_soft', 'score_soft', 'score_risk_soft', 'inv_vol']
 
     for transformer_weight in weights:
         lgb_weight = 1.0 - transformer_weight
@@ -710,24 +708,17 @@ def run_single_val_grid(weights, output_path, penalties):
             daily_scores = []
             daily_details = []
             for date, day_base in base.groupby('date', sort=True):
-                filter_options = [
-                    ('nofilter', day_base),
-                    ('liquidity80', current_filter(day_base)),
-                    ('stable', stable_filter(day_base)),
-                    ('no_extreme_momentum', no_extreme_momentum_filter(day_base)),
-                    ('consensus', consensus_filter(day_base)),
-                    ('consensus_stable', consensus_stable_filter(day_base)),
-                ]
-                selector_options = [
-                    ('equal', equal_topk),
-                    ('risk_soft', risk_soft_topk),
-                    ('score_soft', score_soft_topk),
-                    ('score_risk_soft', score_risk_soft_topk),
-                ]
-                for filter_name, filtered in filter_options:
-                    for weight_name, selector in selector_options:
+                for filter_name in filter_names:
+                    filtered = apply_filter(
+                        day_base,
+                        filter_name,
+                        liquidity_quantile=post_cfg.get('liquidity_quantile', 0.20),
+                        sigma_quantile=post_cfg.get('sigma_quantile', 0.85),
+                    )
+                    for weight_name in weighting_names:
                         key = (filter_name, weight_name)
-                        selected = selector(filtered)
+                        weights_df = build_weight_portfolio(filtered, weight_name)
+                        selected = weights_df_to_selection(weights_df)
                         score, breakdown = score_portfolio(day_base, selected)
                         daily_scores.append({
                             'key': key,
