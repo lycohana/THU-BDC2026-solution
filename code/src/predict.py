@@ -116,7 +116,11 @@ def build_risk_frame(raw_df, stock_ids, latest_date):
 	return pd.DataFrame(rows)
 
 
-def optimize_weights(candidates, score_col='score', risk_col='sigma20', tau=0.4, cap=0.35, exposure_cap=1.0):
+def optimize_weights(candidates, score_col='score', risk_col='sigma20', tau=0.6, cap=0.50, exposure_cap=1.0):
+	"""
+	修复版权重优化：提高 cap 到 0.50，调整 tau 让权重分布更分散
+	避免全部退化成等权 0.2
+	"""
 	raw_score = candidates[score_col].to_numpy(dtype=np.float64)
 	score = (raw_score - raw_score.mean()) / (raw_score.std() + 1e-9)
 	risk = candidates[risk_col].to_numpy(dtype=np.float64)
@@ -129,26 +133,97 @@ def optimize_weights(candidates, score_col='score', risk_col='sigma20', tau=0.4,
 	return out
 
 
+def inv_vol_weights(candidates, k=5, max_weight=0.40, min_weight=0.10, exposure_cap=1.0):
+	"""逆波动率权重：低波动率股票获得更高权重"""
+	top = candidates.sort_values('score', ascending=False).head(k).copy()
+	risk = np.clip(top['sigma20'].to_numpy(dtype=np.float64), 1e-4, None)
+	raw_weight = 1.0 / risk
+	weights = raw_weight / (raw_weight.sum() + 1e-12)
+	weights = np.clip(weights, min_weight, max_weight)
+	weights = weights / (weights.sum() + 1e-12) * exposure_cap
+	out = top[['stock_id']].copy()
+	out['weight'] = np.round(weights, 6)
+	return out
+
+
+def score_soft_weights(candidates, k=5, tau=1.0, max_weight=0.50, min_weight=0.05, exposure_cap=1.0):
+	"""纯分数软权重"""
+	top = candidates.sort_values('score', ascending=False).head(k).copy()
+	score = top['score'].to_numpy(dtype=np.float64)
+	score = (score - score.mean()) / (score.std() + 1e-9)
+	raw_weight = np.exp(score / tau)
+	weights = raw_weight / (raw_weight.sum() + 1e-12)
+	weights = np.clip(weights, min_weight, max_weight)
+	weights = weights / (weights.sum() + 1e-12) * exposure_cap
+	out = top[['stock_id']].copy()
+	out['weight'] = np.round(weights, 6)
+	return out
+
+
 def select_candidates(score_df):
+	"""
+	扩展过滤策略：支持 stable, liquidity80, no_extreme_momentum, consensus, consensus_stable
+	"""
 	post_cfg = config.get('postprocess', {})
 	filter_name = post_cfg.get('filter', 'stable')
 	liquidity_q = post_cfg.get('liquidity_quantile', 0.20)
 	sigma_q = post_cfg.get('sigma_quantile', 0.85)
 
 	filtered = score_df.copy()
-	if filter_name in ('liquidity80', 'stable'):
+
+	# 流动性过滤
+	if filter_name in ('liquidity80', 'stable', 'no_extreme_momentum', 'consensus_stable'):
 		liquidity_floor = filtered['median_amount20'].quantile(liquidity_q)
 		liquid = filtered[filtered['median_amount20'] >= liquidity_floor].copy()
 		if len(liquid) >= 5:
 			filtered = liquid
 
-	if filter_name == 'stable':
+	# 波动率过滤
+	if filter_name in ('stable', 'no_extreme_momentum', 'consensus_stable'):
 		sigma_cap = filtered['sigma20'].quantile(sigma_q)
 		stable = filtered[filtered['sigma20'] <= sigma_cap].copy()
 		if len(stable) >= 5:
 			filtered = stable
 
+	# 极端动量过滤
+	if filter_name == 'no_extreme_momentum':
+		ret5_low = filtered['ret5'].quantile(0.10)
+		ret5_high = filtered['ret5'].quantile(0.90)
+		amp_cap = filtered['amp20'].quantile(0.90)
+		momentum_filtered = filtered[
+			(filtered['ret5'] >= ret5_low)
+			& (filtered['ret5'] <= ret5_high)
+			& (filtered['amp20'] <= amp_cap)
+		].copy()
+		if len(momentum_filtered) >= 5:
+			filtered = momentum_filtered
+
+	# 共识过滤
+	if filter_name in ('consensus', 'consensus_stable'):
+		filtered = filtered.copy()
+		filtered['transformer_rank'] = filtered['transformer'].rank(ascending=False, method='first')
+		filtered['lgb_rank'] = filtered['lgb'].rank(ascending=False, method='first')
+		for cutoff in (30, 50, 80, 120):
+			consensus = filtered[
+				(filtered['transformer_rank'] <= cutoff)
+				& (filtered['lgb_rank'] <= cutoff)
+			].copy()
+			if len(consensus) >= 5:
+				filtered = consensus
+				break
+
 	return filtered.sort_values('score', ascending=False).reset_index(drop=True)
+
+
+def select_weighting_func(weighting_name):
+	"""根据配置选择权重函数"""
+	weighting_map = {
+		'equal': lambda x: equal_weights(x, k=5),
+		'risk_soft': lambda x: optimize_weights(x.head(5)),
+		'score_soft': lambda x: score_soft_weights(x.head(5)),
+		'inv_vol': lambda x: inv_vol_weights(x.head(5)),
+	}
+	return weighting_map.get(weighting_name, weighting_map['equal'])
 
 
 def equal_weights(candidates, exposure_cap=1.0, k=5):
@@ -248,10 +323,14 @@ def main():
 	breadth = latest_processed['return_1'].gt(0).mean() if 'return_1' in latest_processed.columns else 1.0
 	exposure_cap = 0.7 if breadth < 0.30 else 1.0
 	post_cfg = config.get('postprocess', {})
-	if post_cfg.get('weighting', 'equal') == 'equal':
-		output_df = equal_weights(filtered, exposure_cap=exposure_cap)
-	else:
-		output_df = optimize_weights(filtered.head(5), exposure_cap=exposure_cap)
+	weighting_name = post_cfg.get('weighting', 'equal')
+
+	# 使用统一的权重函数选择器
+	weighting_func = select_weighting_func(weighting_name)
+	output_df = weighting_func(filtered)
+
+	# 应用 exposure cap
+	output_df['weight'] = output_df['weight'] * exposure_cap
 	output_df.to_csv(output_path, index=False)
 
 	print(f'[BDC][predict] date={latest_date.date()}')

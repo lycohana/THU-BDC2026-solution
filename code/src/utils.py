@@ -18,6 +18,47 @@ def _mad(x):
     return (x - med).abs().median()
 
 
+def add_enhanced_features(df, enhance_cfg=None):
+    """
+    exp-002-04 特征增强：
+    - 更多动量特征 (ret3, ret7, ret15)
+    - 成交额相对变化
+    - 行业中性化（可选）
+    """
+    df = df.copy()
+    close = df['收盘'].astype(float)
+    amount = df['成交额'].astype(float)
+
+    if enhance_cfg is None:
+        enhance_cfg = {}
+
+    # 更多动量特征
+    if enhance_cfg.get('add_more_momentum', False):
+        df['ret3'] = close.pct_change(fill_method=None, periods=3)
+        df['ret7'] = close.pct_change(fill_method=None, periods=7)
+        df['ret15'] = close.pct_change(fill_method=None, periods=15)
+
+    # 成交额相对变化
+    if enhance_cfg.get('add_amount_change', False):
+        df['amount_ma5'] = amount.rolling(window=5).mean()
+        df['amount_ma20'] = amount.rolling(window=20).mean()
+        df['amount_rel'] = amount / (df['amount_ma5'] + 1e-9)
+        df['amount_rel_ma'] = df['amount_ma5'] / (df['amount_ma20'] + 1e-9)
+
+    # 行业中性化（简化版：用市场收益中性化）
+    if enhance_cfg.get('add_industry_neutral', False):
+        # 计算市场平均收益
+        market_ret = close.pct_change(fill_method=None)
+        # 个股超额收益
+        df['alpha_rel'] = df['return_1'] - market_ret
+
+    # 处理 inf 和 nan
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.fillna(0, inplace=True)
+
+    return df
+
+
 def add_cross_section_features(df, date_col='日期'):
     """Add same-day rank, robust z-score, and market-regime features."""
     out = df.copy()

@@ -12,6 +12,7 @@ from model import StockTransformer
 from lgb_branch import fit_lgb_branches
 from utils import engineer_features_39, engineer_features_158plus39
 from utils import add_cross_section_features, extend_feature_columns_with_cross_section
+from utils import add_enhanced_features
 from utils import create_ranking_dataset_vectorized
 import joblib
 import os
@@ -83,6 +84,13 @@ def _preprocess_common(df, stockid2idx, desc, drop_small_open=True):
 
     processed = _build_label_and_clean(processed, drop_small_open=drop_small_open)
     processed = add_cross_section_features(processed, date_col='日期')
+
+    # exp-002-04: 特征增强
+    enhance_cfg = config.get('feature_enhance', {})
+    if any(enhance_cfg.values()):
+        print(f'[BDC][feature_enhance] 启用特征增强：{enhance_cfg}')
+        processed = add_enhanced_features(processed, enhance_cfg)
+
     feature_columns = extend_feature_columns_with_cross_section(feature_columns, processed)
     return processed, feature_columns
 
@@ -597,7 +605,12 @@ def main():
 
     if config.get('train_lgb', True):
         print("\n=== Training LightGBM rank/reg branches ===")
-        fit_lgb_branches(train_data, val_data, features, output_dir, config)
+        # exp-002-04: 如果配置了超参搜索空间，使用搜索版本
+        if config.get('lgb_search', None):
+            from lgb_branch import fit_lgb_branches_with_search
+            fit_lgb_branches_with_search(train_data, val_data, features, output_dir, config)
+        else:
+            fit_lgb_branches(train_data, val_data, features, output_dir, config)
     
     # 4. 创建排序数据集
     train_sequences, train_targets, train_relevance, train_stock_indices = create_ranking_dataset_vectorized(

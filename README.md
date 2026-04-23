@@ -6,11 +6,11 @@
 
 ## 当前状态
 
-当前阶段：`Phase 2 合法组合层验证已完成，待写入正式推理配置`
+当前阶段：`Phase 2 exp-002-04 进行中：LGBM 超参搜索 + 特征增强`
 
 当前主线：`Phase 1 稳固 baseline` -> `Phase 2 LightGBM 稳分分支` -> `Phase 3 GraphFormer 增量分支` -> `Phase 4 OOF 融合与提交优化`
 
-下一步：将 exp-002-03 的合法验证配置写入正式 `predict.py`，再只用 `test.csv` 做一次最终本地评测。
+下一步：等待 exp-002-04 训练完成，然后推理和评测，更新实验记录。
 
 ## 数据边界硬规则
 
@@ -47,6 +47,7 @@
 | exp-002-02 | 2026-04-23 | Invalid | 不重训 | 旧版 `experiment_blend.py` | 使用了 `data/test.csv` 扫融合权重和后处理 | `0.014451` | `300502/600489/688008/300394/300308`, 等权 `0.2` | 泄漏诊断，仅用于发现问题，不能作为方案依据 |
 | exp-002-03 | 2026-04-23 | Phase 2 组合层 | 不重训 | `uv run python code/src/experiment_blend.py --mode validation` | 仅使用 `train.csv` 内部验证段 | `validation_mean_return=0.027449` | 验证末日 `40/163/158/239/293`, 等权 `0.2` | `Transformer 0.30 / LGBM 0.70 + stable filter + equal weight` |
 | exp-002-03-final | 2026-04-23 | Phase 2 正式推理 | 不重训 | `uv run python app/code/src/test.py` | 固定 exp-002-03 配置后只做最终本地评测 | `0.05757693442603892` | `601899/603799/002384/600362/002463`, 等权 `0.2` | 正式 `predict.py`: `Transformer 0.30 / LGBM 0.70 + stable + equal` |
+| exp-002-04 | 2026-04-23 | Phase 2 超参 + 特征 | `uv run python app/code/src/train.py` | `uv run python app/code/src/test.py` | LGBM 搜索：nl63_mcs32_lr0.03, `lgb_valid=0.2739` | `0.0438415113972748` | 待填写 | 特征增强实现有问题，分数下降，需修复 |
 | exp-003 | 待填写 | Phase 3 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | GraphFormer |
 | exp-004 | 待填写 | Phase 4 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | OOF 融合 |
 
