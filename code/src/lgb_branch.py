@@ -75,7 +75,7 @@ def fit_lgb_branches(train_df, valid_df, feature_cols, output_dir, cfg):
     ranker = lgb.LGBMRanker(
         objective='lambdarank',
         metric='ndcg',
-        eval_at=[5],
+        ndcg_eval_at=[5],
         learning_rate=lgb_cfg.get('rank_learning_rate', 0.03),
         n_estimators=lgb_cfg.get('rank_n_estimators', 1500),
         num_leaves=lgb_cfg.get('num_leaves', 63),

@@ -6,11 +6,11 @@
 
 ## 当前状态
 
-当前阶段：`Phase 2 已接入，正在重训/测试`
+当前阶段：`Phase 2 已完成代码接入，但本地 holdout 低于基准，需要先修融合/后处理`
 
 当前主线：`Phase 1 稳固 baseline` -> `Phase 2 LightGBM 稳分分支` -> `Phase 3 GraphFormer 增量分支` -> `Phase 4 OOF 融合与提交优化`
 
-下一步要填：Phase 2 跑完后的 `lgb_report.json`、`final_score`、`score_self.py` 结果和新 `output/result.csv`。
+下一步：先让 Phase 2 的 `score_self.py` 不低于基准，再进入 GraphFormer 动态相关图分支。
 
 ## 阶段总览
 
@@ -18,7 +18,7 @@
 |---|---|---|---|---|---|
 | Phase 0 | Done | 复制 baseline，新建独立仓库 | `THU-BDC2026-solution/` | 仓库可运行 | 保留 baseline 只作对照 |
 | Phase 1 | Done | 修样本口径、加横截面特征、补赛事入口、改推理权重 | `best_model.pth`、`scaler.pkl`、`final_score.txt`、`result.csv` | `final_score=0.037838` | 作为 Phase 2 对照基线 |
-| Phase 2 | In Progress | 加入 LightGBM Ranker + Regressor 稳分分支 | `lgb_ranker.pkl`、`lgb_regressor.pkl`、`lgb_features.json`、`lgb_report.json` | 待填写 | 跑完训练/推理/本地打分后补表 |
+| Phase 2 | Needs Fix | 加入 LightGBM Ranker + Regressor 稳分分支 | `lgb_ranker.pkl`、`lgb_regressor.pkl`、`lgb_features.json`、`lgb_report.json` | `transformer_final=0.055197`, `lgb_valid=0.279713`, `score_self=0.004426`, 低于基准 `0.025179` | 先调融合/后处理 |
 | Phase 3 | Todo | 将 dense CrossStockAttention 升级为动态图 GraphFormer | `graphformer_*.pth`、图配置、验证报告 | 待填写 | Phase 2 稳定后开始 |
 | Phase 4 | Todo | walk-forward OOF、融合权重搜索、相关性去重、最终提交优化 | `oof_predictions.*`、`blend_config.json`、最终 `result.csv` | 待填写 | Phase 3 后开始 |
 | Phase 5 | Todo | Docker 复现、镜像导出、提交前检查 | `team_name.tar`、Docker 复现日志 | 待填写 | 最终提交前完成 |
@@ -34,8 +34,10 @@
 
 | 实验 | 日期 | 阶段 | 训练命令 | 推理命令 | 验证指标 | 本地打分 | result.csv 摘要 | 备注 |
 |---|---|---|---|---|---|---|---|---|
-| exp-001 | 2026-04-23 | Phase 1 | `uv run python app/code/src/train.py` | `uv run python app/code/src/test.py` | `best_epoch=10`, `final_score=0.037838` | 待补 | `600023/601668/601018/601818/601186`, 等权 `0.2` | Phase 1 对照基线 |
-| exp-002 | 待填写 | Phase 2 | `uv run python app/code/src/train.py` | `uv run python app/code/src/test.py` | 待填写 | 待填写 | 待填写 | 当前正在跑 |
+| exp-001 | 2026-04-23 | Phase 1 | `uv run python app/code/src/train.py` | `uv run python app/code/src/test.py` | `best_epoch=10`, `final_score=0.037838` | 空 | `600023/601668/601018/601818/601186`, 等权 `0.2` | Phase 1 对照基线 |
+| baseline-main | 2026-04-23 | Baseline | 基准已有产物 | `uv run python test/score_self.py` | 原始基准输出 | `0.02517949121691857` | `600023/601668/601018/601818/601186`, 等权 `0.2` | `THU-BDC2026-main` 重算确认 |
+| exp-002 | 2026-04-23 | Phase 2 | `uv run python app/code/src/train.py` | `uv run python app/code/src/test.py` | `best_epoch=21`, `transformer_final=0.055197`, `lgb_valid=0.279713` | `0.0044263938292461585` | `300502/600489/300308/603993/300394`, 等权 `0.2` | 低于基准，需修融合 |
+| exp-002-02 | 2026-04-23 | Phase 2 消融 | 不重训 | `uv run python code/src/experiment_blend.py` | 扫融合权重和后处理 | 最优 `0.014451` | `300502/600489/688008/300394/300308`, 等权 `0.2` | `Transformer 0.40 / LGBM 0.60`, 仍低于外部对照线 |
 | exp-003 | 待填写 | Phase 3 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | GraphFormer |
 | exp-004 | 待填写 | Phase 4 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | OOF 融合 |
 
@@ -49,6 +51,38 @@ stock_id,weight
 601818,0.2
 601186,0.2
 ```
+
+Phase 2 `lgb_report.json` 快照：
+
+```json
+{
+  "rank_best_iteration": 854,
+  "reg_best_iteration": 4,
+  "valid_final_score": 0.27971309242085596,
+  "num_features": 253,
+  "num_train_rows": 143690,
+  "num_valid_rows": 27000
+}
+```
+
+Phase 2 `result.csv` 快照：
+
+```csv
+stock_id,weight
+300502,0.2
+600489,0.2
+300308,0.2
+603993,0.2
+300394,0.2
+```
+
+Phase 2 消融结论：
+
+- 当前默认融合 `Transformer 0.55 / LGBM 0.45` 的本地分数是 `0.0044263938292461585`。
+- 不重训只扫融合权重后，当前最优为 `Transformer 0.40 / LGBM 0.60`，本地分数 `0.014451`。
+- 消融最优组合仍低于外部对照线 `0.02517949121691857`，所以 Phase 2 不能直接作为最终稳分方案。
+- `risk_soft` 经常退化成等权，原因是 `cap=0.35` 截断后再归一化，Top5 权重容易全部变成 `0.2`。
+- 当前问题重点不是训练是否跑通，而是验证代理、融合权重和组合后处理与最终 `score_self.py` 目标不一致。
 
 ## Todo 清单
 
@@ -70,10 +104,15 @@ stock_id,weight
 - [x] 保存 `lgb_ranker.pkl`、`lgb_regressor.pkl`、`lgb_features.json`、`lgb_report.json`。
 - [x] 推理端自动检测 LGBM 产物并融合 `Transformer + LGBM`。
 - [x] `pyproject.toml` 与 `uv.lock` 加入 LightGBM。
-- [ ] 完整重训，确认生成 `lgb_report.json`。
-- [ ] 完整推理，确认日志显示 `分数来源: transformer+lgb(...)`。
-- [ ] 运行 `uv run python test/score_self.py`。
-- [ ] 将 Phase 2 分数和 `result.csv` 补进实验记录表。
+- [x] 完整重训，确认生成 `lgb_report.json`。
+- [x] 完整推理，确认日志显示 `分数来源: transformer+lgb(...)`。
+- [x] 运行 `uv run python test/score_self.py`。
+- [x] 将 Phase 2 分数和 `result.csv` 补进实验记录表。
+- [ ] 调整融合权重或增加候选回退，使 `score_self.py` 不低于基准 `0.02517949121691857`。
+- [ ] 检查权重优化被 `cap=0.35` 全部截断导致最终等权的问题。
+- [x] 新增 `code/src/experiment_blend.py`，用于不重训扫描融合权重和后处理。
+- [x] 完成 exp-002-02 消融，当前最优 `0.014451`。
+- [ ] 重新设计组合权重，避免 `risk_soft` 退化为等权。
 
 ### Phase 3：GraphFormer 增量分支
 
