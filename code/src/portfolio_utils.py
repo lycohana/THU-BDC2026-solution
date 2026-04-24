@@ -76,11 +76,35 @@ def _topk(score_df, k=5):
     return score_df.sort_values('score', ascending=False).head(k).copy()
 
 
+def _available_zscore(out, col, default=0.0):
+    if col not in out.columns:
+        return np.full(len(out), default, dtype=np.float64)
+    values = out[col].replace([np.inf, -np.inf], np.nan).fillna(out[col].median() if out[col].notna().any() else 0.0)
+    return _zscore(values.to_numpy(dtype=np.float64))
+
+
+def _available_log_zscore(out, col, default=0.0):
+    if col not in out.columns:
+        return np.full(len(out), default, dtype=np.float64)
+    values = out[col].replace([np.inf, -np.inf], np.nan)
+    values = values.fillna(values.median() if values.notna().any() else 0.0)
+    return _zscore(np.log1p(values.clip(lower=0).to_numpy(dtype=np.float64)))
+
+
 def equal_weight_portfolio(score_df, k=5, exposure_cap=1.0):
     top = _topk(score_df, k=k)
     if len(top) == 0:
         return top.assign(weight=pd.Series(dtype=float))
     weights = np.full(len(top), exposure_cap / len(top), dtype=np.float64)
+    return _to_weight_frame(top, weights)
+
+
+def fixed_descending_weight_portfolio(score_df, k=5, exposure_cap=1.0):
+    top = _topk(score_df, k=k)
+    base = np.array([0.24, 0.22, 0.20, 0.18, 0.16], dtype=np.float64)[:len(top)]
+    if len(top) == 0:
+        return top.assign(weight=pd.Series(dtype=float))
+    weights = base / (base.sum() + 1e-12) * exposure_cap
     return _to_weight_frame(top, weights)
 
 
@@ -202,6 +226,85 @@ def topk_filter(score_df, k=10):
     return out if len(out) >= 5 else score_df
 
 
+def stable_topk_filter(score_df, k=30, liquidity_quantile=0.20, sigma_quantile=0.85):
+    out = stable_filter(score_df, liquidity_quantile=liquidity_quantile, sigma_quantile=sigma_quantile)
+    filtered = out.sort_values('score', ascending=False).head(k).copy()
+    return filtered if len(filtered) >= 5 else out
+
+
+def stable_topk_rerank_filter(
+    score_df,
+    k=30,
+    liquidity_quantile=0.20,
+    sigma_quantile=0.85,
+    variant='balanced',
+):
+    """Select stable top-k candidates, then rerank with train-time observable signals."""
+    out = stable_topk_filter(
+        score_df,
+        k=k,
+        liquidity_quantile=liquidity_quantile,
+        sigma_quantile=sigma_quantile,
+    ).copy()
+    if len(out) < 5:
+        return out.sort_values('score', ascending=False).reset_index(drop=True)
+
+    fused = _available_zscore(out, 'score')
+    lgb = _available_zscore(out, 'lgb')
+    transformer = _available_zscore(out, 'transformer')
+    ret20 = _available_zscore(out, 'ret20')
+    ret5 = _available_zscore(out, 'ret5')
+    liquidity = _available_zscore(out, 'median_amount20')
+    log_liquidity = _available_log_zscore(out, 'median_amount20')
+    sigma = _available_zscore(out, 'sigma20')
+    amp = _available_zscore(out, 'amp20')
+
+    disagreement = np.abs(_zscore(transformer) - _zscore(lgb))
+
+    if variant == 'trend':
+        rerank_score = 0.50 * fused + 0.20 * lgb + 0.15 * ret20 + 0.10 * ret5 + 0.05 * liquidity - 0.10 * disagreement
+    elif variant == 'defensive':
+        rerank_score = 0.45 * fused + 0.20 * lgb + 0.15 * liquidity - 0.15 * sigma - 0.10 * amp - 0.10 * disagreement
+    elif variant == 'lgb_anchor':
+        rerank_score = 0.45 * lgb + 0.25 * fused + 0.10 * transformer + 0.10 * ret20 + 0.05 * liquidity - 0.10 * sigma
+    elif variant == 'liquidity_risk_off':
+        rerank_score = (
+            0.30 * fused
+            + 0.30 * log_liquidity
+            + 0.10 * ret5
+            + 0.10 * ret20
+            - 0.05 * sigma
+            - 0.15 * amp
+        )
+    else:
+        rerank_score = 0.55 * fused + 0.15 * lgb + 0.10 * transformer + 0.10 * ret20 + 0.05 * liquidity - 0.10 * sigma - 0.05 * disagreement
+
+    out['base_score'] = out['score']
+    out['rerank_score'] = rerank_score
+    out['score'] = out['rerank_score']
+    return out.sort_values('score', ascending=False).reset_index(drop=True)
+
+
+def _is_extreme_risk_off(score_df):
+    required = {'ret20', 'sigma20'}
+    if not required.issubset(score_df.columns) or len(score_df) == 0:
+        return False
+    ret20 = score_df['ret20'].replace([np.inf, -np.inf], np.nan).dropna().astype(float)
+    sigma = score_df['sigma20'].replace([np.inf, -np.inf], np.nan).dropna().astype(float)
+    if ret20.empty or sigma.empty:
+        return False
+    breadth20 = float((ret20 > 0).mean())
+    median_ret20 = float(ret20.median())
+    dispersion20 = float(ret20.std(ddof=0))
+    median_sigma20 = float(sigma.median())
+    return (
+        median_ret20 < 0.0
+        and breadth20 < 0.45
+        and median_sigma20 > 0.018
+        and dispersion20 > 0.10
+    )
+
+
 def apply_filter(score_df, filter_name, liquidity_quantile=0.20, sigma_quantile=0.85):
     if filter_name == 'nofilter':
         return score_df.sort_values('score', ascending=False).reset_index(drop=True)
@@ -217,6 +320,30 @@ def apply_filter(score_df, filter_name, liquidity_quantile=0.20, sigma_quantile=
         return consensus_stable_filter(score_df, liquidity_quantile=liquidity_quantile, sigma_quantile=sigma_quantile).sort_values('score', ascending=False).reset_index(drop=True)
     if filter_name == 'topk10':
         return topk_filter(score_df, k=10).sort_values('score', ascending=False).reset_index(drop=True)
+    if filter_name == 'stable_top30':
+        return stable_topk_filter(score_df, k=30, liquidity_quantile=liquidity_quantile, sigma_quantile=sigma_quantile).sort_values('score', ascending=False).reset_index(drop=True)
+    if filter_name == 'stable_top30_rerank':
+        return stable_topk_rerank_filter(score_df, k=30, liquidity_quantile=liquidity_quantile, sigma_quantile=sigma_quantile)
+    if filter_name == 'stable_top30_rerank_trend':
+        return stable_topk_rerank_filter(score_df, k=30, liquidity_quantile=liquidity_quantile, sigma_quantile=sigma_quantile, variant='trend')
+    if filter_name == 'stable_top30_rerank_defensive':
+        return stable_topk_rerank_filter(score_df, k=30, liquidity_quantile=liquidity_quantile, sigma_quantile=sigma_quantile, variant='defensive')
+    if filter_name == 'stable_top30_rerank_lgb_anchor':
+        return stable_topk_rerank_filter(score_df, k=30, liquidity_quantile=liquidity_quantile, sigma_quantile=sigma_quantile, variant='lgb_anchor')
+    if filter_name == 'regime_liquidity_risk_off':
+        if _is_extreme_risk_off(score_df):
+            return stable_topk_rerank_filter(
+                score_df,
+                k=30,
+                liquidity_quantile=liquidity_quantile,
+                sigma_quantile=sigma_quantile,
+                variant='liquidity_risk_off',
+            )
+        return stable_filter(
+            score_df,
+            liquidity_quantile=liquidity_quantile,
+            sigma_quantile=sigma_quantile,
+        ).sort_values('score', ascending=False).reset_index(drop=True)
     raise ValueError(f'Unsupported filter_name: {filter_name}')
 
 
@@ -231,6 +358,7 @@ def select_candidates(score_df, post_cfg=None):
 def build_weight_portfolio(score_df, weighting_name, k=5, exposure_cap=1.0):
     weighting_map = {
         'equal': equal_weight_portfolio,
+        'fixed_descending': fixed_descending_weight_portfolio,
         'risk_soft': risk_soft_weight_portfolio,
         'score_soft': score_soft_weight_portfolio,
         'score_risk_soft': score_risk_soft_weight_portfolio,

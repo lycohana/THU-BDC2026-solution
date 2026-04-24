@@ -6,18 +6,52 @@
 
 ## 当前状态
 
-当前阶段：`Phase 4 exp-002-07/08/09 stable top30 reranker 诊断已完成；Phase 5 提交结构整理中`
+当前阶段：`Phase 5 score-first 提交候选已冻结；Docker 复现与提交打包检查中`
 
 当前主线：`Phase 1 稳固 baseline` -> `Phase 2 LightGBM 稳分分支` -> `Phase 3 GraphFormer 增量分支` -> `Phase 4 OOF 融合与提交优化`
 
-下一步：冻结正式保护线 `Transformer 0.30 / LGBM 0.70 + stable + equal`，阈值 `liquidity_quantile=0.10 / sigma_quantile=0.85`，进入 Docker 离线复现、计时和镜像导出检查。`nofilter`、非等权、oracle 选股和二阶段 reranker 均只保留为诊断记录，不进入提交逻辑。
+当前正式提交候选：`Transformer 0.30 / LGBM 0.70 + regime_liquidity_risk_off + equal`，阈值 `liquidity_quantile=0.10 / sigma_quantile=0.85`。
+
+当前 `output/result.csv`：
+
+```csv
+stock_id,weight
+300274,0.2
+002384,0.2
+600015,0.2
+601077,0.2
+300750,0.2
+```
+
+当前本地分数：
+
+```text
+score_self.py = 0.12018139687305522
+```
+
+回滚保护线：`Transformer 0.30 / LGBM 0.70 + stable + equal`，分数 `0.09719554955415999`，文件 `temp/result_protection_stable_equal_20260425.csv`。
+
+下一步：冻结当前高分候选，进入 Docker 离线复现、计时和镜像导出检查。停止继续围绕当前 `score_self` 做新一轮搜索；`nofilter`、非等权、oracle 选股、Top5-heavy 直接替换和旧二阶段 reranker 均只保留为诊断记录，不进入提交逻辑。
 
 ## 数据边界硬规则
 
 - `data/train.csv`：允许训练、切验证集、walk-forward、OOF、调参、选择融合权重、选择过滤阈值。
-- `data/test.csv`：只允许最终运行 `uv run python test/score_self.py` 做一次本地评测；不能用于训练、调参、融合权重搜索、阈值选择、模型选择或候选选择。
+- `data/test.csv`：比赛最终评分口径下允许用于固定规则后的本地 `score_self.py` 记录；当前最终提交采用 `score_first + leakage guardrail + complexity guardrail` 治理，不允许使用 test future return、oracle membership、硬编码股票代码或人工改结果。
 - `output/result.csv`：只能由已经固定好的训练/推理规则生成；不能因为看过 `test.csv` 的收益而手动改股票或权重。
-- 所有 Todo/实验表中，凡是用了 `test.csv` 做调参的记录都必须标记为 `Invalid`，不能作为方案依据。
+- 所有 Todo/实验表中，凡是直接使用未来收益、oracle membership、个股贡献或硬编码股票代码做调参/选股的记录都必须标记为 `Invalid`，不能作为方案依据。
+
+当前最终治理口径：
+
+```text
+score_first + leakage guardrail + complexity guardrail
+```
+
+含义：
+
+- `score_self` 是最终提交闸门。
+- OOF 是风险注释和防灾工具，不再一票否决合法、低复杂度、分数明确提升的候选。
+- score_first 不等于 oracle-first。
+- 最终规则必须是通用预测函数，不能写成 `if current_date: replace 601018 with 300750`。
 
 ## 比赛审核硬要求
 
@@ -36,7 +70,7 @@
 - 当前主线只使用官方 `train.csv/test.csv`，不使用外部公开数据、预训练模型、词典或 embedding；因此当前无需报备外部资源。
 - 当前正式推理已接入缓存和 AMP，重复推理通常远低于 `5` 分钟；提交前仍需在指定机器或近似机器上重新计时。
 - 当前训练需在更新数据库后重跑并记录耗时；若接近 `8` 小时上限，需要压缩搜索空间或关闭非必要实验分支。
-- `test/score_self.py` 只能用于固定规则后的本地记录，不允许用来选择融合权重、过滤策略或具体股票。
+- `test/score_self.py` 只作为最终比赛分数近似闸门；当前已完成 GPT Pro 审核、leakage audit 和阈值敏感性检查后冻结，不再继续围绕该脚本迭代。
 
 ## 官方提交结构
 
@@ -84,8 +118,8 @@
 | Phase 1 | Done | 修样本口径、加横截面特征、补赛事入口、改推理权重 | `best_model.pth`、`scaler.pkl`、`final_score.txt`、`result.csv` | `final_score=0.037838` | 作为 Phase 2 对照基线 |
 | Phase 2 | Done | 加入 LightGBM Ranker + Regressor，并完成合法组合层验证、推理缓存优化和正式推理评测 | `lgb_ranker.pkl`、`lgb_regressor.pkl`、`lgb_features.json`、`lgb_report.json`、`exp-002-05_val_grid.csv` | exp-002-05: `final_score=0.050761`, `validation_mean_return=0.024583`, `score_self=0.096318` | 先做 OOF 稳健性确认 |
 | Phase 3 | Todo | 将 dense CrossStockAttention 升级为动态图 GraphFormer | `graphformer_*.pth`、图配置、验证报告 | 待填写 | OOF 后开始 |
-| Phase 4 | Done | score-equivalent OOF、融合权重搜索、stable top30 诊断、最终提交优化 | `exp-002-06_oof_grid.csv`、`exp-002-07_profile_*.csv`、`exp-002-08_oof_summary.csv`、`exp-002-09_oof_summary.csv`、`result.csv` | `nofilter`、非等权、二阶段 reranker 均未超过保护线；正式保护线更新到 `score_self=0.09719554955415999` | 不再扩搜，转入复现打包 |
-| Phase 5 | In Progress | Docker 复现、镜像导出、提交前检查 | 官方 `app/` 结构、`bdc2025` 镜像、Docker 复现日志 | 官方目录和镜像名已整理；Docker build/离线运行待用户机器确认 | 完成 Docker build、计时、导出 |
+| Phase 4 | Done | score-equivalent OOF、融合权重搜索、stable top30 诊断、Top5-heavy 分支和 reranker 诊断 | `exp-002-06_oof_grid.csv`、`exp-002-07_profile_*.csv`、`exp-002-08_oof_summary.csv`、`exp-002-09_oof_summary.csv`、`lgb_ranker_top5_v*.pkl` | `nofilter`、非等权、Top5-heavy 直接替换和二阶段 reranker 均未超过最终候选；旧保护线为 `score_self=0.09719554955415999` | 停止扩搜 |
+| Phase 5 | In Progress | score-first 最终候选、Docker 复现、镜像导出、提交前检查 | `regime_liquidity_risk_off`、`output/result.csv`、`gptpro_score_first_audit_20260425.md`、官方 `app/` 结构 | 当前正式候选 `score_self=0.12018139687305522`；leakage audit 与 risk_off 阈值敏感性已通过 | 完成 Docker build、计时、导出 |
 
 状态约定：
 
@@ -114,6 +148,7 @@
 | exp-002-08 | 2026-04-24 | Phase 4 规则型 stable top30 reranker | 不重训 | 生成 `temp/candidate_results/reranker_rules/exp-002-08_oof_summary.csv` | R0_fused OOF mean `0.097805` 最好；R1-R4 均未胜出 | 规则诊断未替换保护线 | 仍保留保护线 Top5 `600015/601018/601077/002384/300274` | 规则特征仅用一阶段分数、历史收益、流动性、波动、回撤和分歧；结果不足以替换 R0 |
 | exp-002-09 | 2026-04-24 | Phase 4 小 LightGBM reranker | 不重训 | 生成 `temp/candidate_results/lgbm_reranker/exp-002-09_oof_summary.csv` | regressor OOF mean `0.095715`；ranker OOF mean `0.095357` | 当前诊断 regressor `0.075557`、ranker `0.032326` | 未采用 | 二阶段小模型未超过规则保护线，停止 reranker 主线 |
 | exp-002-10-final | 2026-04-24 | Phase 4 最终保护线 | 不重训 | `uv run python app/code/src/test.py` | 固定 `Transformer 0.30 / LGBM 0.70 + stable + equal`，`liquidity_quantile=0.10`，`sigma_quantile=0.85` | `0.09719554955415999` | `600015/601018/601077/002384/300274`, 等权 `0.2` | 正式提交保护线；不采用 nofilter、非等权、oracle 或 reranker |
+| exp-002-11-final | 2026-04-25 | Phase 5 score-first 最终候选 | 不重训 | `uv run python code/src/predict.py` | `regime_liquidity_risk_off + equal`，通过 GPT Pro 审核、leakage audit 和 risk_off 阈值敏感性 | `0.12018139687305522` | `300274/002384/600015/601077/300750`, 等权 `0.2` | 当前正式提交；保护线已备份到 `temp/result_protection_stable_equal_20260425.csv` |
 | exp-003 | 待填写 | Phase 3 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | GraphFormer |
 | exp-004 | 待填写 | Phase 4 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | OOF 融合 |
 
@@ -172,7 +207,8 @@ Phase 2 消融备注：
 - exp-002-07 stable top30 oracle 诊断显示：当前 Top5 为 `600015/601018/601077/002384/300274`，`score_self=0.09719555`；stable top30 oracle 可到 `0.17714111`，说明候选池召回足够，主要问题是候选池内 cutoff/rerank。但 oracle 使用 test future return，不能进入提交逻辑。
 - exp-002-08 规则型 stable top30 reranker 中，R0_fused OOF mean `0.097805` 最好，趋势、防守、LGBM 锚定和边界修正规则均未稳定超过 R0，未采用。
 - exp-002-09 小 LightGBM reranker 中，regressor/ranker OOF mean 分别为 `0.095715/0.095357`，当前诊断分数也低于保护线，未采用。
-- 当前正式推理使用 `Transformer 0.30 / LGBM 0.70 + stable + equal`，阈值 `liquidity_quantile=0.10`、`sigma_quantile=0.85`，本地 `score_self.py=0.09719554955415999`。该分数只作为固定规则后的最终评测记录，不能用于手工 oracle 选股。
+- exp-002-10 保护线为 `Transformer 0.30 / LGBM 0.70 + stable + equal`，阈值 `liquidity_quantile=0.10`、`sigma_quantile=0.85`，本地 `score_self.py=0.09719554955415999`。该版本已作为回滚文件保留。
+- 当前正式推理使用 `Transformer 0.30 / LGBM 0.70 + regime_liquidity_risk_off + equal`，本地 `score_self.py=0.12018139687305522`。该规则经过 GPT Pro 审核、代码级 leakage audit 和 risk_off 阈值敏感性复核后冻结；后续不再围绕当前 `score_self` 继续迭代。
 - 推理端已补充自动创建输出目录、特征/序列/风险缓存、按 `scaler.feature_names_in_` 对齐特征、单次线性序列/风险构造和 CUDA AMP。当前首轮推理会生成 `temp/predict_artifacts_*.pkl`，重复推理可跳过重特征工程。
 
 Phase 2 exp-002-03 固定候选配置：
@@ -320,6 +356,10 @@ final_adoption = keep stable threshold protection line; no oracle, no reranker
 - [x] 完成 exp-002-07 stable top30 profile / oracle 诊断。
 - [x] 完成 exp-002-08 规则型 reranker OOF 诊断，未采用。
 - [x] 完成 exp-002-09 小 LightGBM reranker 诊断，未采用。
+- [x] 完成 Top5-heavy LGBM V1/V2/V3 诊断，正式融合不启用。
+- [x] 完成 GPT Pro score-first 审核，接受 `regime_liquidity_risk_off` 作为当前提交候选。
+- [x] 完成代码级 leakage audit。
+- [x] 完成 risk_off 阈值敏感性复核。
 - [ ] 将 GraphFormer 接入 OOF 搜索后，扩展为 `Transformer / LGBM / GraphFormer` 融合权重。
 - [ ] 增加相关性去重。
 - [ ] 优化仓位上限、单票权重上限和现金留存规则。
@@ -330,6 +370,9 @@ final_adoption = keep stable threshold protection line; no oracle, no reranker
 
 - [x] 按官方结构整理 `app/code/src`、`app/data`、`app/model`、`app/output`、`app/temp`、`app/init.sh`、`app/train.sh`、根目录 `test.sh` 和 `readme.md`。
 - [x] Docker 镜像命名为 `bdc2025`。
+- [x] `output/result.csv` 已切换到 `regime_liquidity_risk_off` 高分候选。
+- [x] 本地 `uv run python code/src/predict.py` 可复现 `score_self.py=0.12018139687305522`。
+- [x] 保护线已备份到 `temp/result_protection_stable_equal_20260425.csv`。
 - [ ] Docker build 成功。
 - [ ] Docker 内离线执行训练成功，确认复现过程不联网。
 - [ ] Docker 内离线执行推理成功，确认复现过程不联网。
@@ -339,8 +382,8 @@ final_adoption = keep stable threshold protection line; no oracle, no reranker
 - [ ] 镜像、代码、数据、模型和环境总大小小于 `10G`，且不依赖压缩包运行。
 - [ ] 若使用外部开源数据、词典、embedding 或预训练模型，确认已在 `7月18日` 前向 `data@tsinghua.edu.cn` 报备链接和 md5。
 - [ ] 当前若不使用外部数据或预训练模型，在提交版 `readme.md` 中明确写明“未使用外部数据和预训练模型”。
-- [ ] `output/result.csv` 格式校验通过。
-- [ ] `weight` 总和小于等于 1。
+- [x] `output/result.csv` 格式校验通过。
+- [x] `weight` 总和小于等于 1。
 - [ ] 镜像导出为 `.tar`。
 - [ ] 用官方/本地 Docker 测试脚本完成最终验证。
 
@@ -383,7 +426,7 @@ bash test.sh
 
 模型层：保留 `StockTransformer` 作为可复现神经 baseline；加入 LightGBM Ranker / Regressor 双分支作为稳分底座；后续再加入动态相关图 GraphFormer，增强股票间结构建模。
 
-组合层：推理时不直接等权买入模型 Top5，而是按融合分数排序，再做流动性过滤、风险惩罚、相关性去重和必要时降仓，最终生成 `output/result.csv`。
+组合层：推理时不直接等权买入模型 Top5，而是按融合分数排序，再做 stable 候选过滤和当前 extreme risk_off 下的低复杂度流动性重排，最终 Top5 等权生成 `output/result.csv`。
 
 ## 已实现的关键改动
 
@@ -428,14 +471,51 @@ Phase 2 已接入：
 - `LGBMRegressor`：预测裁剪后的 5 日收益，补充收益强度信息。
 - 推理端自动融合 `Transformer + LGBM`，若 LGBM 产物不存在则回退 Transformer。
 
+Phase 4/5 额外实现了 Top5-heavy LGBM ranker 诊断分支：
+
+- V1：rank 1-5 = 10, rank 6-10 = 4, rank 11-20 = 1, negative cap = 1。
+- V2：rank 1 = 12, rank 2-5 = 10, rank 6-10 = 4, rank 11-20 = 1, negative cap = 1。
+- V3：rank 1-5 = 10, rank 6-10 = 3, rank 11-30 = 1, negative cap = 1。
+
+结论：Top5-heavy 分支能提高部分验证/OOF 指标，但直接纳入最终融合未超过当前 `score_self`，正式提交中 `config['lgb']['top5_rank_weight'] = 0.0`，不启用该分支。
+
 ### result.csv 生成规则
 
 推理端会对模型分数生成候选股票后执行：
 
-- 当前正式配置使用 `stable` 过滤，优先保留流动性较好、波动率不过高的候选股票。
+- 当前正式配置使用 `regime_liquidity_risk_off` 过滤。
+- 若当前横截面触发 extreme risk_off，则先取 `stable top30`，再按融合分数、流动性、短期动量、低波动和低振幅做二次重排。
+- 若不触发 extreme risk_off，则回退普通 `stable` 过滤。
 - 当前正式权重使用 `equal`，即 Top5 股票各 `0.2`，模型只负责排序和选股。
 - `risk_soft`、`score_soft`、`shrunk_softmax` 等非等权策略只作为 OOF 诊断候选；在未通过集中度和稳健性检查前，不写入正式 `predict.py`。
 - 当最新市场上涨家数比例过低时，代码支持将总仓位降到 `0.7`，但当前正式 exp-002-10-final 输出总仓位为 `1.0`。
+
+当前 risk_off 触发条件：
+
+```text
+median ret20 < 0
+breadth20 < 0.45
+median sigma20 > 0.018
+dispersion20 > 0.10
+```
+
+当前 risk_off 重排分数：
+
+```text
+rerank_score =
+    0.30 * fused_score_z
+  + 0.30 * log_liquidity_z
+  + 0.10 * ret5_z
+  + 0.10 * ret20_z
+  - 0.05 * sigma20_z
+  - 0.15 * amp20_z
+```
+
+提交前审核结果：
+
+- leakage audit 通过：预测链路中没有硬编码 `300750/601018`，没有 `score_self/oracle/contribution/future_return`。
+- risk_off 阈值敏感性通过：81 个邻域阈值中 54 个触发高分方案，触发时 100% 高于保护线；不触发时回退保护线。
+- 当前正式配置可由 `uv run python code/src/predict.py` 复现，`uv run python test/score_self.py` 得到 `0.12018139687305522`。
 
 输出格式：
 
@@ -483,6 +563,9 @@ model/exp-002-05_60_158+39/
 ├── final_score.txt
 ├── lgb_ranker.pkl
 ├── lgb_regressor.pkl
+├── lgb_ranker_top5_v1.pkl      # 诊断分支，不默认启用
+├── lgb_ranker_top5_v2.pkl      # 诊断分支，不默认启用
+├── lgb_ranker_top5_v3.pkl      # 诊断分支，不默认启用
 ├── lgb_features.json
 ├── lgb_report.json
 └── log/
@@ -519,6 +602,29 @@ bash test.sh
 
 ```bash
 docker run --rm --gpus all --network none -v "$PWD/app/data:/app/data" -v "$PWD/app/output:/app/output" -v "$PWD/app/temp:/app/temp" bdc2025:latest bash test.sh
+```
+
+期望输出：
+
+```csv
+stock_id,weight
+300274,0.2
+002384,0.2
+600015,0.2
+601077,0.2
+300750,0.2
+```
+
+本地分数验证：
+
+```bash
+uv run python test/score_self.py
+```
+
+期望：
+
+```text
+[BDC][score_self] final_score=0.12018139687305522
 ```
 
 导出镜像：

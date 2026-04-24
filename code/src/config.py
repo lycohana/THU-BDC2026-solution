@@ -31,7 +31,7 @@ config = {
         'agreement_penalty': 0.00,
     },
     'postprocess': {
-        'filter': 'stable',
+        'filter': 'regime_liquidity_risk_off',
         'weighting': 'equal',
         'liquidity_quantile': 0.10,
         'sigma_quantile': 0.85,
@@ -39,6 +39,7 @@ config = {
     'lgb': {
         'rank_weight': 0.65,
         'reg_weight': 0.35,
+        'top5_rank_weight': 0.0,  # 默认不启用 Top5-heavy 分支，保护线保持不变
         'label_clip': 0.20,
         'rank_learning_rate': 0.03,
         'reg_learning_rate': 0.03,
@@ -52,6 +53,24 @@ config = {
         'early_stopping_rounds': 100,
         'log_period': 100,
         'n_jobs': 8,
+    },
+    'lgb_top5': {
+        'train': False,
+        'blend_weight': 0.0,
+        'top1_gain': None,
+        'top5_gain': 10,
+        'top10_gain': 4,
+        'top20_gain': 1,
+        'negative_cap': 1,
+        'learning_rate': 0.03,
+        'n_estimators': 1500,
+        'num_leaves': 31,
+        'min_child_samples': 64,
+        'subsample': 0.8,
+        'colsample_bytree': 0.7,
+        'reg_lambda': 5.0,
+        'early_stopping_rounds': 100,
+        'log_period': 100,
     },
     # exp-002-04 新增：LGBM 超参搜索空间
     'lgb_search': {

@@ -4,6 +4,7 @@ exp-002-04: Walk-Forward OOF + 修复权重优化 + 扩展过滤策略
 import argparse
 import os
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -19,7 +20,7 @@ if str(ROOT / 'code' / 'src') not in sys.path:
 
 from config import config
 from feature_registry import finalize_feature_frame, get_feature_columns, get_feature_engineer
-from lgb_branch import load_lgb_branches, predict_lgb_score
+from lgb_branch import load_lgb_branches, predict_lgb_components, predict_lgb_score
 from model import StockTransformer
 from portfolio_utils import (
     add_forward_open_returns,
@@ -31,6 +32,30 @@ from portfolio_utils import (
 )
 from train import preprocess_val_data, split_train_val_by_last_month
 from predict import zscore
+
+
+def _log_step(message, start_time=None):
+    if start_time is None:
+        print(f'[BDC][OOF] {message}', flush=True)
+        return time.perf_counter()
+    elapsed = time.perf_counter() - start_time
+    print(f'[BDC][OOF] {message} done in {elapsed:.1f}s', flush=True)
+    return time.perf_counter()
+
+
+def _format_grid_size(weights, penalties, lgb_rank_weights, lgb_top5_weights, liquidity_quantiles, sigma_quantiles, filter_names, weighting_names, n_days=None):
+    per_day = (
+        len(weights)
+        * len(penalties)
+        * len(lgb_rank_weights)
+        * len(lgb_top5_weights)
+        * len(liquidity_quantiles)
+        * len(sigma_quantiles)
+        * len(filter_names)
+        * len(weighting_names)
+    )
+    total = per_day * int(n_days or 0)
+    return per_day, total
 
 
 # ==================== 过滤策略 ====================
@@ -166,23 +191,171 @@ def score_portfolio(day_df, weights_df):
     )
 
 
+def _metrics_from_weights(weights):
+    weights = np.asarray(weights, dtype=np.float64)
+    if weights.size == 0:
+        return {
+            'max_weight': 0.0,
+            'top2_weight': 0.0,
+            'herfindahl': 0.0,
+            'entropy_effective_n': 0.0,
+        }
+    sorted_weights = np.sort(weights)[::-1]
+    positive = weights[weights > 1e-12]
+    entropy = -float(np.sum(positive * np.log(positive)))
+    return {
+        'max_weight': float(sorted_weights[0]),
+        'top2_weight': float(sorted_weights[:2].sum()) if sorted_weights.size >= 2 else float(sorted_weights.sum()),
+        'herfindahl': float(np.sum(np.square(weights))),
+        'entropy_effective_n': float(np.exp(entropy)),
+    }
+
+
+def _fast_weighted_score(day_base, filtered, weighting_name, k=5):
+    """Fast scorer-equivalent TopK evaluation for OOF grid search."""
+    top = filtered.sort_values('score', ascending=False).head(k).copy()
+    if len(top) == 0:
+        return 0.0, _metrics_from_weights(np.array([], dtype=np.float64))
+
+    if 'forward_open_return' in top.columns and top['forward_open_return'].notna().all():
+        returns = top['forward_open_return'].to_numpy(dtype=np.float64)
+    else:
+        return_map = day_base.set_index('stock_id')['forward_open_return']
+        returns = top['stock_id'].map(return_map).fillna(0.0).to_numpy(dtype=np.float64)
+
+    if weighting_name == 'equal':
+        weights = np.full(len(top), 1.0 / len(top), dtype=np.float64)
+    elif weighting_name == 'fixed_descending':
+        base = np.array([0.24, 0.22, 0.20, 0.18, 0.16], dtype=np.float64)[:len(top)]
+        weights = base / (base.sum() + 1e-12)
+    else:
+        weights_df = build_weight_portfolio(filtered, weighting_name)
+        return_map = day_base.set_index('stock_id')['forward_open_return']
+        returns = weights_df['stock_id'].map(return_map).fillna(0.0).to_numpy(dtype=np.float64)
+        weights = weights_df['weight'].to_numpy(dtype=np.float64)
+
+    return float(np.dot(weights, returns)), _metrics_from_weights(weights)
+
+
 def _code_ids_from_instrument_ids(instrument_ids, idx2stock):
     return [normalize_stock_id(idx2stock[int(idx)]) for idx in instrument_ids]
 
 
-def _apply_blend_scores(score_df, transformer_weight, lgb_weight, penalty):
+def _apply_blend_scores(score_df, transformer_weight, lgb_weight, penalty, lgb_rank_weight=None, lgb_top5_weight=0.0):
     """Match predict.py: z-score each prediction cross-section, not the whole fold."""
     out = score_df.copy()
     score_chunks = []
+    if lgb_rank_weight is None:
+        lgb_rank_weight = float(config.get('lgb', {}).get('rank_weight', 0.65))
+    lgb_reg_weight = 1.0 - float(lgb_rank_weight)
+    lgb_top5_weight = float(lgb_top5_weight or 0.0)
     for _, day in out.groupby('date', sort=False):
         transformer_z = zscore(day['transformer'].to_numpy(dtype=np.float64))
-        lgb_z = zscore(day['lgb'].to_numpy(dtype=np.float64))
+        if {'lgb_rank_score', 'lgb_reg_score'}.issubset(day.columns):
+            lgb_z = (
+                float(lgb_rank_weight) * zscore(day['lgb_rank_score'].to_numpy(dtype=np.float64))
+                + lgb_reg_weight * zscore(day['lgb_reg_score'].to_numpy(dtype=np.float64))
+            )
+            if lgb_top5_weight > 0 and 'lgb_top5_rank_score' in day.columns:
+                lgb_z = lgb_z + lgb_top5_weight * zscore(day['lgb_top5_rank_score'].to_numpy(dtype=np.float64))
+                lgb_z = lgb_z / (1.0 + lgb_top5_weight)
+        else:
+            lgb_z = zscore(day['lgb'].to_numpy(dtype=np.float64))
         score = transformer_weight * transformer_z + lgb_weight * lgb_z
         if penalty > 0:
             score = score - penalty * np.abs(transformer_z - lgb_z)
         score_chunks.append(pd.Series(score, index=day.index))
     out['score'] = pd.concat(score_chunks).sort_index()
+    lgb_chunks = []
+    for _, day in out.groupby('date', sort=False):
+        if {'lgb_rank_score', 'lgb_reg_score'}.issubset(day.columns):
+            lgb_day = (
+                float(lgb_rank_weight) * zscore(day['lgb_rank_score'].to_numpy(dtype=np.float64))
+                + lgb_reg_weight * zscore(day['lgb_reg_score'].to_numpy(dtype=np.float64))
+            )
+            if lgb_top5_weight > 0 and 'lgb_top5_rank_score' in day.columns:
+                lgb_day = lgb_day + lgb_top5_weight * zscore(day['lgb_top5_rank_score'].to_numpy(dtype=np.float64))
+                lgb_day = lgb_day / (1.0 + lgb_top5_weight)
+        else:
+            lgb_day = zscore(day['lgb'].to_numpy(dtype=np.float64))
+        lgb_chunks.append(pd.Series(lgb_day, index=day.index))
+    out['lgb'] = pd.concat(lgb_chunks).sort_index()
     return out
+
+
+def _combine_lgb_components(components, rank_weight, top5_weight=0.0):
+    rank_weight = float(rank_weight)
+    reg_weight = 1.0 - rank_weight
+    score = (
+        rank_weight * zscore(components['rank_score'])
+        + reg_weight * zscore(components['reg_score'])
+    )
+    top5_weight = float(top5_weight or 0.0)
+    if top5_weight > 0 and 'top5_rank_score' in components:
+        score = score + top5_weight * zscore(components['top5_rank_score'])
+        score = score / (1.0 + top5_weight)
+    return score
+
+
+def _complexity_level(row):
+    """Lower is better when OOF performance is close."""
+    filter_name = row['filter']
+    weighting_name = row['weighting']
+    rank_weight = float(row.get('lgb_rank_weight', config.get('lgb', {}).get('rank_weight', 0.65)))
+    default_rank_weight = float(config.get('lgb', {}).get('rank_weight', 0.65))
+    top5_weight = float(row.get('lgb_top5_weight', 0.0))
+    transformer_weight = float(row.get('transformer_weight', config.get('blend', {}).get('transformer_weight', 0.30)))
+    default_transformer_weight = float(config.get('blend', {}).get('transformer_weight', 0.30))
+    liquidity_q = float(row.get('liquidity_quantile', config.get('postprocess', {}).get('liquidity_quantile', 0.10)))
+    default_liquidity_q = float(config.get('postprocess', {}).get('liquidity_quantile', 0.10))
+    sigma_q = float(row.get('sigma_quantile', config.get('postprocess', {}).get('sigma_quantile', 0.85)))
+    default_sigma_q = float(config.get('postprocess', {}).get('sigma_quantile', 0.85))
+
+    if filter_name == 'nofilter':
+        return 99
+
+    level = 0
+    if filter_name == 'stable' and weighting_name == 'equal':
+        if (
+            abs(rank_weight - default_rank_weight) <= 1e-12
+            and abs(transformer_weight - default_transformer_weight) <= 1e-12
+            and abs(liquidity_q - default_liquidity_q) <= 1e-12
+            and abs(sigma_q - default_sigma_q) <= 1e-12
+        ):
+            return 0
+        return 1
+
+    if filter_name == 'stable' and weighting_name == 'fixed_descending':
+        level = 3
+    elif filter_name in {'stable_top30', 'stable_top30_rerank', 'stable_top30_rerank_trend', 'stable_top30_rerank_defensive', 'stable_top30_rerank_lgb_anchor'}:
+        level = 2 if weighting_name == 'equal' else 4
+    elif filter_name == 'regime_liquidity_risk_off':
+        level = 4
+    elif filter_name in {'consensus', 'topk10', 'consensus_stable'}:
+        level = 2
+    else:
+        level = 3
+
+    if weighting_name in {'shrunk_t2_rho10_cap30_min05', 'shrunk_t3_rho20_cap35_min05', 'shrunk_t5_rho30_cap35_min08'}:
+        level = max(level, 5)
+    if weighting_name in {'score_soft', 'score_risk_soft'}:
+        level = max(level, 6)
+    if weighting_name in {'risk_soft', 'inv_vol'}:
+        level = max(level, 8)
+    if top5_weight > 0:
+        level = max(level, 3)
+    return level
+
+
+def _bootstrap_prob_positive(values, n_boot=2000, seed=42):
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 0.0
+    rng = np.random.default_rng(seed)
+    sample_idx = rng.integers(0, values.size, size=(n_boot, values.size))
+    sample_means = values[sample_idx].mean(axis=1)
+    return float((sample_means > 0).mean())
 
 
 def _write_calibration_diagnostics(score_df, output_path):
@@ -329,21 +502,29 @@ def build_oof_samples_for_fold(full_df, fold_info, features, sequence_length, st
     if len(context_df) == 0:
         return None, None, None
 
+    timer = _log_step(f'fold={fold_info["fold"]} preprocess context rows={len(context_df)}')
     val_df, generated_features = preprocess_oof_data(context_df, stockid2idx)
+    timer = _log_step(f'fold={fold_info["fold"]} preprocess rows={len(val_df)}', timer)
     val_df['instrument_id'] = val_df['instrument'].astype(int)
     for feature in features:
         if feature not in val_df.columns:
             val_df[feature] = 0.0
 
+    timer = _log_step(f'fold={fold_info["fold"]} risk features')
     risk_df = _build_risk_features(val_df)
+    timer = _log_step(f'fold={fold_info["fold"]} risk rows={len(risk_df)}', timer)
+    timer = _log_step(f'fold={fold_info["fold"]} scaler transform')
     val_df[features] = val_df[features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     val_df[features] = scaler.transform(val_df[features])
+    timer = _log_step(f'fold={fold_info["fold"]} scaler transform', timer)
 
+    timer = _log_step(f'fold={fold_info["fold"]} validation samples')
     samples = [
         sample
         for sample in build_validation_samples(val_df, features, sequence_length, val_start)
         if pd.Timestamp(sample['date']) <= val_end
     ]
+    _log_step(f'fold={fold_info["fold"]} samples={len(samples)}', timer)
 
     return samples, risk_df, val_df
 
@@ -353,7 +534,8 @@ def _build_risk_features(data):
     data = data.copy()
     data['日期'] = pd.to_datetime(data['日期'])
     rows = []
-    for stock_id, group in data.groupby('股票代码', sort=False):
+    grouped_stocks = list(data.groupby('股票代码', sort=False))
+    for stock_id, group in tqdm(grouped_stocks, desc='OOF风险特征', leave=False):
         group = group.sort_values('日期')
         close = group['收盘'].astype(float)
         high = group['最高'].astype(float)
@@ -383,6 +565,12 @@ def run_oof_grid(
     n_folds=4,
     weights=None,
     penalties=None,
+    lgb_rank_weights=None,
+    lgb_top5_weights=None,
+    liquidity_quantiles=None,
+    sigma_quantiles=None,
+    filter_names=None,
+    weighting_names=None,
     output_path='temp/oof_combo_grid.csv',
     fold_window_months=2,
     gap_months=1,
@@ -397,9 +585,44 @@ def run_oof_grid(
     - output_path: 输出路径
     """
     if weights is None:
-        weights = [0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]
+        weights = [0.1, 0.2]
     if penalties is None:
-        penalties = [0.0, 0.1, 0.2]
+        penalties = [0.0]
+    if lgb_rank_weights is None:
+        lgb_rank_weights = [0.7, 0.9]
+    if lgb_top5_weights is None:
+        lgb_top5_weights = [0.0]
+    post_cfg = config.get('postprocess', {})
+    if liquidity_quantiles is None:
+        liquidity_quantiles = [0.05, 0.08, 0.10]
+    if sigma_quantiles is None:
+        sigma_quantiles = [0.87, 0.90]
+    if filter_names is None:
+        filter_names = [
+            'stable',
+            'stable_top30_rerank_trend',
+        ]
+    if weighting_names is None:
+        weighting_names = ['equal', 'fixed_descending']
+    per_day_grid, _ = _format_grid_size(
+        weights,
+        penalties,
+        lgb_rank_weights,
+        lgb_top5_weights,
+        liquidity_quantiles,
+        sigma_quantiles,
+        filter_names,
+        weighting_names,
+    )
+    print(
+        '[BDC][OOF] grid='
+        f'weights:{len(weights)} penalties:{len(penalties)} '
+        f'lgb_rank:{len(lgb_rank_weights)} lgb_top5:{len(lgb_top5_weights)} '
+        f'liq:{len(liquidity_quantiles)} sigma:{len(sigma_quantiles)} '
+        f'filters:{len(filter_names)} weightings:{len(weighting_names)} '
+        f'per_day:{per_day_grid}',
+        flush=True,
+    )
 
     print(f'[BDC][OOF] 加载数据...')
     data_file = os.path.join(config['data_path'], 'train.csv')
@@ -463,7 +686,8 @@ def run_oof_grid(
 
         # 为该折的每个样本评分
         scored_days = []
-        for sample in samples:
+        timer = _log_step(f'fold={fold_idx} model scoring samples={len(samples)}')
+        for sample in tqdm(samples, desc=f'fold {fold_idx} scoring', leave=False):
             with torch.no_grad():
                 x = torch.from_numpy(sample['sequences']).unsqueeze(0).to(device)
                 transformer_scores = model(x).squeeze(0).detach().cpu().numpy()
@@ -480,7 +704,15 @@ def run_oof_grid(
             day_features['_order'] = day_features['instrument_id'].map(order_map)
             day_features = day_features.sort_values('_order')
 
-            lgb_scores = predict_lgb_score(lgb_bundle, day_features, config)
+            lgb_components = predict_lgb_components(lgb_bundle, day_features)
+            if lgb_components is not None:
+                lgb_scores = _combine_lgb_components(
+                    lgb_components,
+                    float(config.get('lgb', {}).get('rank_weight', 0.65)),
+                    0.0,
+                )
+            else:
+                lgb_scores = None
             sample_stock_codes = _code_ids_from_instrument_ids(sample['stock_ids'], idx2stock)
 
             day = pd.DataFrame({
@@ -489,12 +721,16 @@ def run_oof_grid(
                 'target': sample['targets'],
                 'transformer': transformer_scores[:len(sample['stock_ids'])],
                 'lgb': lgb_scores[:len(sample['stock_ids'])] if lgb_scores is not None else 0.0,
+                'lgb_rank_score': lgb_components['rank_score'][:len(sample['stock_ids'])] if lgb_components is not None else 0.0,
+                'lgb_reg_score': lgb_components['reg_score'][:len(sample['stock_ids'])] if lgb_components is not None else 0.0,
+                'lgb_top5_rank_score': lgb_components['top5_rank_score'][:len(sample['stock_ids'])] if lgb_components is not None and 'top5_rank_score' in lgb_components else 0.0,
             }).merge(risk_df, on=['date', 'stock_id'], how='left')
             day = day.merge(forward_return_df, on=['date', 'stock_id'], how='left')
             day = day.dropna(subset=['forward_open_return']).copy()
             if len(day) < 10:
                 continue
             scored_days.append(day)
+        timer = _log_step(f'fold={fold_idx} model scoring days={len(scored_days)}', timer)
 
         if not scored_days:
             print(f'[BDC][OOF] 折次 {fold_idx} 无可评分日期，跳过')
@@ -509,7 +745,20 @@ def run_oof_grid(
         all_scored_frames.append(fold_score_df)
 
         # 在该折上运行网格搜索
-        fold_results = _run_grid_on_fold(fold_score_df, weights, penalties, fold_idx)
+        timer = _log_step(f'fold={fold_idx} grid search')
+        fold_results = _run_grid_on_fold(
+            fold_score_df,
+            weights,
+            penalties,
+            fold_idx,
+            lgb_rank_weights=lgb_rank_weights,
+            lgb_top5_weights=lgb_top5_weights,
+            liquidity_quantiles=liquidity_quantiles,
+            sigma_quantiles=sigma_quantiles,
+            filter_names=filter_names,
+            weighting_names=weighting_names,
+        )
+        _log_step(f'fold={fold_idx} grid rows={len(fold_results)}', timer)
         all_fold_results.append(fold_results)
         print(f'[BDC][OOF] 折次 {fold_idx} 完成，{len(fold_results)} 条结果')
 
@@ -519,7 +768,17 @@ def run_oof_grid(
     combined = pd.concat(all_fold_results, ignore_index=True)
 
     aggregated = combined.groupby(
-        ['transformer_weight', 'lgb_weight', 'agreement_penalty', 'filter', 'weighting'],
+        [
+            'transformer_weight',
+            'lgb_weight',
+            'agreement_penalty',
+            'lgb_rank_weight',
+            'lgb_top5_weight',
+            'liquidity_quantile',
+            'sigma_quantile',
+            'filter',
+            'weighting',
+        ],
         as_index=False,
     ).agg(
         oof_mean_return=('validation_mean_return', 'mean'),
@@ -529,6 +788,13 @@ def run_oof_grid(
         oof_min_return=('validation_min_return', 'min'),
         oof_max_return=('validation_mean_return', 'max'),
         oof_last_fold_return=('last_fold_return', 'last'),
+        oof_mean_diff=('validation_mean_diff', 'mean'),
+        oof_median_diff=('validation_median_diff', 'mean'),
+        oof_q10_diff=('validation_q10_diff', 'mean'),
+        oof_min_diff=('validation_min_diff', 'min'),
+        latest_fold_diff=('last_fold_diff', 'last'),
+        fold_win_rate=('fold_mean_diff_positive', 'mean'),
+        daily_win_rate_vs_baseline=('daily_win_rate_vs_baseline', 'mean'),
         win_rate_vs_equal=('win_rate_vs_equal', 'mean'),
         avg_max_weight=('avg_max_weight', 'mean'),
         avg_top2_weight=('avg_top2_weight', 'mean'),
@@ -539,9 +805,59 @@ def run_oof_grid(
         folds=('fold', list),
     )
     aggregated['oof_std_return'] = aggregated['oof_std_return'].fillna(0.0)
+    group_cols = [
+        'transformer_weight',
+        'lgb_weight',
+        'agreement_penalty',
+        'lgb_rank_weight',
+        'lgb_top5_weight',
+        'liquidity_quantile',
+        'sigma_quantile',
+        'filter',
+        'weighting',
+    ]
+    bootstrap_rows = []
+    for key, group in combined.groupby(group_cols, sort=False):
+        row = dict(zip(group_cols, key))
+        row['bootstrap_p_diff_gt0'] = _bootstrap_prob_positive(group['validation_mean_diff'].to_numpy(dtype=np.float64))
+        bootstrap_rows.append(row)
+    aggregated = aggregated.merge(pd.DataFrame(bootstrap_rows), on=group_cols, how='left')
+    aggregated['complexity_level'] = aggregated.apply(_complexity_level, axis=1)
+    aggregated['passes_basic_gate'] = (
+        (aggregated['constraint_pass_rate'] >= 1.0)
+        & (aggregated['oof_mean_diff'] > 0.0)
+        & (aggregated['oof_median_diff'] > 0.0)
+        & (aggregated['bootstrap_p_diff_gt0'] >= 0.75)
+        & (aggregated['fold_win_rate'] >= 0.50)
+        & (aggregated['oof_q10_diff'] >= -0.002)
+        & (aggregated['latest_fold_diff'] >= -0.002)
+    )
+    aggregated['passes_complexity_gate'] = aggregated['passes_basic_gate'] & (
+        (
+            (aggregated['complexity_level'] <= 1)
+            & (aggregated['bootstrap_p_diff_gt0'] >= 0.75)
+        )
+        | (
+            (aggregated['complexity_level'] <= 3)
+            & (aggregated['bootstrap_p_diff_gt0'] >= 0.80)
+        )
+        | (
+            (aggregated['complexity_level'] > 3)
+            & (aggregated['bootstrap_p_diff_gt0'] >= 0.85)
+        )
+    )
     aggregated = aggregated.sort_values(
-        ['oof_mean_return', 'oof_median_return', 'win_rate_vs_equal', 'constraint_pass_rate'],
-        ascending=[False, False, False, False],
+        [
+            'passes_complexity_gate',
+            'passes_basic_gate',
+            'bootstrap_p_diff_gt0',
+            'oof_mean_diff',
+            'oof_median_diff',
+            'oof_q10_diff',
+            'latest_fold_diff',
+            'complexity_level',
+        ],
+        ascending=[False, False, False, False, False, False, False, True],
     )
 
     output_path = Path(output_path)
@@ -564,86 +880,182 @@ def run_oof_grid(
     return aggregated
 
 
-def _run_grid_on_fold(score_df, weights, penalties, fold_idx):
+def _run_grid_on_fold(
+    score_df,
+    weights,
+    penalties,
+    fold_idx,
+    lgb_rank_weights=None,
+    lgb_top5_weights=None,
+    liquidity_quantiles=None,
+    sigma_quantiles=None,
+    filter_names=None,
+    weighting_names=None,
+):
     """在单个折上运行网格搜索"""
     rows = []
-    post_cfg = config.get('postprocess', {})
-    filter_names = ['nofilter', 'liquidity80', 'stable', 'no_extreme_momentum', 'consensus', 'consensus_stable', 'topk10']
-    weighting_names = [
-        'equal',
-        'risk_soft',
-        'score_soft',
-        'score_risk_soft',
-        'inv_vol',
-        'shrunk_t2_rho10_cap30_min05',
-        'shrunk_t3_rho20_cap35_min05',
-        'shrunk_t5_rho30_cap35_min08',
+    if lgb_rank_weights is None:
+        lgb_rank_weights = [0.7, 0.9]
+    if lgb_top5_weights is None:
+        lgb_top5_weights = [0.0]
+    if liquidity_quantiles is None:
+        liquidity_quantiles = [0.05, 0.08, 0.10]
+    if sigma_quantiles is None:
+        sigma_quantiles = [0.87, 0.90]
+    if filter_names is None:
+        filter_names = [
+            'stable',
+            'stable_top30_rerank_trend',
+        ]
+    if weighting_names is None:
+        weighting_names = [
+            'equal',
+            'fixed_descending',
+        ]
+
+    n_days = score_df['date'].nunique() if 'date' in score_df.columns else 0
+    per_day_grid, total_grid = _format_grid_size(
+        weights,
+        penalties,
+        lgb_rank_weights,
+        lgb_top5_weights,
+        liquidity_quantiles,
+        sigma_quantiles,
+        filter_names,
+        weighting_names,
+        n_days=n_days,
+    )
+    print(
+        f'[BDC][OOF] fold={fold_idx} grid detail days={n_days}, per_day={per_day_grid}, total_eval~{total_grid}',
+        flush=True,
+    )
+
+    baseline_base = _apply_blend_scores(
+        score_df,
+        0.30,
+        0.70,
+        0.0,
+        lgb_rank_weight=float(config.get('lgb', {}).get('rank_weight', 0.65)),
+        lgb_top5_weight=0.0,
+    )
+    baseline_daily_scores = {}
+    baseline_groups = list(baseline_base.groupby('date', sort=True))
+    for date, baseline_day in tqdm(baseline_groups, desc=f'fold {fold_idx} baseline', leave=False):
+        baseline_filtered = apply_filter(
+            baseline_day,
+            'stable',
+            liquidity_quantile=0.10,
+            sigma_quantile=0.85,
+        )
+        baseline_score, _ = _fast_weighted_score(baseline_day, baseline_filtered, 'equal')
+        baseline_daily_scores[date] = baseline_score
+
+    fusion_tasks = [
+        (transformer_weight, 1.0 - transformer_weight, penalty, lgb_rank_weight, lgb_top5_weight)
+        for transformer_weight in weights
+        for penalty in penalties
+        for lgb_rank_weight in lgb_rank_weights
+        for lgb_top5_weight in lgb_top5_weights
     ]
+    for transformer_weight, lgb_weight, penalty, lgb_rank_weight, lgb_top5_weight in tqdm(
+        fusion_tasks,
+        desc=f'fold {fold_idx} fusion grid',
+        leave=False,
+    ):
+        base = _apply_blend_scores(
+            score_df,
+            transformer_weight,
+            lgb_weight,
+            penalty,
+            lgb_rank_weight=lgb_rank_weight,
+            lgb_top5_weight=lgb_top5_weight,
+        )
 
-    for transformer_weight in weights:
-        lgb_weight = 1.0 - transformer_weight
+        daily_scores = []
+        day_groups = list(base.groupby('date', sort=True))
+        for date, day_base in tqdm(day_groups, desc=f'fold {fold_idx} days t{transformer_weight:.2f} lrw{float(lgb_rank_weight):.2f} t5{float(lgb_top5_weight):.2f}', leave=False):
+            if date not in baseline_daily_scores:
+                continue
+            baseline_score = baseline_daily_scores[date]
+            for liquidity_q in liquidity_quantiles:
+                for sigma_q in sigma_quantiles:
+                    for filter_name in filter_names:
+                        filtered = apply_filter(
+                            day_base,
+                            filter_name,
+                            liquidity_quantile=liquidity_q,
+                            sigma_quantile=sigma_q,
+                        )
+                        equal_score, _ = _fast_weighted_score(day_base, filtered, 'equal')
+                        for weight_name in weighting_names:
+                            try:
+                                score, metrics = _fast_weighted_score(day_base, filtered, weight_name)
+                                diff = score - baseline_score
+                                daily_scores.append({
+                                    'key': (filter_name, weight_name, liquidity_q, sigma_q),
+                                    'date': date,
+                                    'score': score,
+                                    'baseline_score': baseline_score,
+                                    'diff_vs_baseline': diff,
+                                    'win_vs_baseline': float(diff > 0.0),
+                                    'win_vs_equal': float(score > equal_score),
+                                    'max_weight': metrics['max_weight'],
+                                    'top2_weight': metrics['top2_weight'],
+                                    'herfindahl': metrics['herfindahl'],
+                                    'entropy_effective_n': metrics['entropy_effective_n'],
+                                    'constraint_ok': float(
+                                        metrics['top2_weight'] <= 0.70
+                                        and metrics['herfindahl'] <= 0.28
+                                        and metrics['entropy_effective_n'] >= 4.0
+                                    ),
+                                })
+                            except Exception:
+                                continue
 
-        for penalty in penalties:
-            base = _apply_blend_scores(score_df, transformer_weight, lgb_weight, penalty)
+        if not daily_scores:
+            continue
 
-            daily_scores = []
-            for date, day_base in base.groupby('date', sort=True):
-                for filter_name in filter_names:
-                    filtered = apply_filter(
-                        day_base,
-                        filter_name,
-                        liquidity_quantile=post_cfg.get('liquidity_quantile', 0.20),
-                        sigma_quantile=post_cfg.get('sigma_quantile', 0.85),
-                    )
-                    equal_df = build_weight_portfolio(filtered, 'equal')
-                    equal_score, _ = score_portfolio(day_base, equal_df)
-                    for weight_name in weighting_names:
-                        try:
-                            weights_df = build_weight_portfolio(filtered, weight_name)
-                            score, _ = score_portfolio(day_base, weights_df)
-                            metrics = portfolio_metrics(weights_df)
-                            daily_scores.append({
-                                'key': (filter_name, weight_name),
-                                'date': date,
-                                'score': score,
-                                'win_vs_equal': float(score > equal_score),
-                                'max_weight': metrics['max_weight'],
-                                'top2_weight': metrics['top2_weight'],
-                                'herfindahl': metrics['herfindahl'],
-                                'entropy_effective_n': metrics['entropy_effective_n'],
-                                'constraint_ok': float(
-                                    metrics['top2_weight'] <= 0.70
-                                    and metrics['herfindahl'] <= 0.28
-                                    and metrics['entropy_effective_n'] >= 4.0
-                                ),
-                            })
-                        except Exception:
-                            continue
-
-            for (filter_name, weight_name), grouped in pd.DataFrame(daily_scores).groupby('key', sort=False):
-                grouped = grouped.sort_values('date')
-                rows.append({
-                    'fold': fold_idx,
-                    'experiment': f'fold{fold_idx}_t{transformer_weight:.2f}_l{lgb_weight:.2f}_p{penalty:.2f}_{filter_name}_{weight_name}',
-                    'transformer_weight': transformer_weight,
-                    'lgb_weight': lgb_weight,
-                    'agreement_penalty': penalty,
-                    'filter': filter_name,
-                    'weighting': weight_name,
-                    'validation_mean_return': float(grouped['score'].mean()),
-                    'validation_median_return': float(grouped['score'].median()),
-                    'validation_std_return': float(grouped['score'].std(ddof=0)),
-                    'validation_q10_return': float(grouped['score'].quantile(0.10)),
-                    'validation_min_return': float(grouped['score'].min()),
-                    'last_fold_return': float(grouped['score'].iloc[-1]),
-                    'win_rate_vs_equal': float(grouped['win_vs_equal'].mean()),
-                    'avg_max_weight': float(grouped['max_weight'].mean()),
-                    'avg_top2_weight': float(grouped['top2_weight'].mean()),
-                    'avg_herfindahl': float(grouped['herfindahl'].mean()),
-                    'avg_entropy_effective_n': float(grouped['entropy_effective_n'].mean()),
-                    'constraint_pass_rate': float(grouped['constraint_ok'].mean()),
-                    'n_days': int(len(grouped)),
-                })
+        for (filter_name, weight_name, liquidity_q, sigma_q), grouped in pd.DataFrame(daily_scores).groupby('key', sort=False):
+            grouped = grouped.sort_values('date')
+            rows.append({
+                'fold': fold_idx,
+                'experiment': (
+                    f'fold{fold_idx}_t{transformer_weight:.2f}_l{lgb_weight:.2f}'
+                    f'_p{penalty:.2f}_lrw{float(lgb_rank_weight):.2f}'
+                    f'_t5w{float(lgb_top5_weight):.2f}'
+                    f'_liq{float(liquidity_q):.2f}_sig{float(sigma_q):.2f}'
+                    f'_{filter_name}_{weight_name}'
+                ),
+                'transformer_weight': transformer_weight,
+                'lgb_weight': lgb_weight,
+                'agreement_penalty': penalty,
+                'lgb_rank_weight': float(lgb_rank_weight),
+                'lgb_top5_weight': float(lgb_top5_weight),
+                'liquidity_quantile': float(liquidity_q),
+                'sigma_quantile': float(sigma_q),
+                'filter': filter_name,
+                'weighting': weight_name,
+                'validation_mean_return': float(grouped['score'].mean()),
+                'validation_median_return': float(grouped['score'].median()),
+                'validation_std_return': float(grouped['score'].std(ddof=0)),
+                'validation_q10_return': float(grouped['score'].quantile(0.10)),
+                'validation_min_return': float(grouped['score'].min()),
+                'last_fold_return': float(grouped['score'].iloc[-1]),
+                'validation_mean_diff': float(grouped['diff_vs_baseline'].mean()),
+                'validation_median_diff': float(grouped['diff_vs_baseline'].median()),
+                'validation_q10_diff': float(grouped['diff_vs_baseline'].quantile(0.10)),
+                'validation_min_diff': float(grouped['diff_vs_baseline'].min()),
+                'last_fold_diff': float(grouped['diff_vs_baseline'].iloc[-1]),
+                'fold_mean_diff_positive': float(grouped['diff_vs_baseline'].mean() > 0.0),
+                'daily_win_rate_vs_baseline': float(grouped['win_vs_baseline'].mean()),
+                'win_rate_vs_equal': float(grouped['win_vs_equal'].mean()),
+                'avg_max_weight': float(grouped['max_weight'].mean()),
+                'avg_top2_weight': float(grouped['top2_weight'].mean()),
+                'avg_herfindahl': float(grouped['herfindahl'].mean()),
+                'avg_entropy_effective_n': float(grouped['entropy_effective_n'].mean()),
+                'constraint_pass_rate': float(grouped['constraint_ok'].mean()),
+                'n_days': int(len(grouped)),
+            })
 
     return pd.DataFrame(rows)
 
@@ -726,7 +1138,8 @@ def build_validation_samples(val_data, features, sequence_length, min_window_end
     data = data.dropna(subset=['label'])
 
     windows = []
-    for stock_code, group in data.groupby('instrument_id', sort=False):
+    grouped_stocks = list(data.groupby('instrument_id', sort=False))
+    for stock_code, group in tqdm(grouped_stocks, desc='OOF构建股票窗口', leave=False):
         if len(group) < sequence_length:
             continue
         feature_values = group[features].values.astype(np.float32)
@@ -745,8 +1158,10 @@ def build_validation_samples(val_data, features, sequence_length, min_window_end
             })
 
     window_df = pd.DataFrame(windows)
+    print(f'[BDC][OOF] validation windows={len(window_df)}', flush=True)
     samples = []
-    for date, day in window_df.groupby('date', sort=True):
+    grouped_dates = list(window_df.groupby('date', sort=True))
+    for date, day in tqdm(grouped_dates, desc='OOF聚合交易日', leave=False):
         if len(day) < 10:
             continue
         samples.append({
@@ -937,26 +1352,58 @@ def parse_args():
     parser.add_argument('--mode', default='oof', choices=['oof', 'validation'],
                         help='oof=Walk-Forward OOF, validation=单验证集 (exp-002-03 兼容)')
     parser.add_argument('--n_folds', type=int, default=4, help='OOF 折数')
-    parser.add_argument('--weights', default='0,0.2,0.3,0.4,0.5,0.6,0.7,0.8,1.0',
+    parser.add_argument('--weights', default='0.1,0.2',
                         help='Comma-separated transformer weights.')
-    parser.add_argument('--penalties', default='0,0.1,0.2',
+    parser.add_argument('--penalties', default='0',
                         help='Comma-separated agreement penalties.')
+    parser.add_argument('--lgb_rank_weights', default='0.7,0.9',
+                        help='Comma-separated LGB rank/reg blend weights; reg weight is 1-rank_weight.')
+    parser.add_argument('--lgb_top5_weights', default='0',
+                        help='Comma-separated Top5-heavy LGB ranker weights added inside the LGB branch.')
+    parser.add_argument('--liquidity_quantiles', default='0.05,0.08,0.10',
+                        help='Comma-separated stable liquidity quantiles.')
+    parser.add_argument('--sigma_quantiles', default='0.87,0.90',
+                        help='Comma-separated stable sigma quantiles.')
+    parser.add_argument('--filters', default='stable,stable_top30_rerank_trend',
+                        help='Comma-separated candidate modes.')
+    parser.add_argument('--weightings', default='equal,fixed_descending',
+                        help='Comma-separated weighting modes.')
     parser.add_argument('--output', default='temp/oof_combo_grid.csv', help='Output path')
     parser.add_argument('--fold_window_months', type=int, default=2, help='每个 OOF 验证窗口的月份数')
     parser.add_argument('--gap_months', type=int, default=1, help='相邻 OOF 验证窗口之间的月份间隔')
     return parser.parse_args()
 
 
+def _parse_float_list(text):
+    return [float(x) for x in text.split(',') if x.strip()]
+
+
+def _parse_str_list(text):
+    return [x.strip() for x in text.split(',') if x.strip()]
+
+
 def main():
     args = parse_args()
-    weights = [float(x) for x in args.weights.split(',') if x.strip()]
-    penalties = [float(x) for x in args.penalties.split(',') if x.strip()]
+    weights = _parse_float_list(args.weights)
+    penalties = _parse_float_list(args.penalties)
+    lgb_rank_weights = _parse_float_list(args.lgb_rank_weights)
+    lgb_top5_weights = _parse_float_list(args.lgb_top5_weights)
+    liquidity_quantiles = _parse_float_list(args.liquidity_quantiles)
+    sigma_quantiles = _parse_float_list(args.sigma_quantiles)
+    filter_names = _parse_str_list(args.filters)
+    weighting_names = _parse_str_list(args.weightings)
 
     if args.mode == 'oof':
         run_oof_grid(
             n_folds=args.n_folds,
             weights=weights,
             penalties=penalties,
+            lgb_rank_weights=lgb_rank_weights,
+            lgb_top5_weights=lgb_top5_weights,
+            liquidity_quantiles=liquidity_quantiles,
+            sigma_quantiles=sigma_quantiles,
+            filter_names=filter_names,
+            weighting_names=weighting_names,
             output_path=args.output,
             fold_window_months=args.fold_window_months,
             gap_months=args.gap_months,
