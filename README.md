@@ -2,7 +2,7 @@
 
 本项目为 THU-BDC2026 股票 Top5 选股/配权方案。最终推理入口生成 `output/result.csv`，格式为 `stock_id,weight`，最多 5 只股票，总权重不超过 1。
 
-当前根目录 `README.md` 面向代码审核、Docker 复现和最终提交准备。研发过程、实验流水账和 Todo 记录已移至 [docs/DEV_README.md](docs/DEV_README.md)。
+当前根目录 `readme.md` 面向代码审核、Docker 复现和最终提交准备。研发过程、实验流水账和 Todo 记录已移至 [docs/DEV_README.md](docs/DEV_README.md)。
 
 ## 环境配置
 
@@ -96,9 +96,11 @@ lgb_weight = 0.70
 agreement_penalty = 0.00
 postprocess.filter = stable
 postprocess.weighting = equal
+postprocess.liquidity_quantile = 0.10
+postprocess.sigma_quantile = 0.85
 ```
 
-`risk_soft`、`score_soft`、`shrunk_softmax` 等非等权策略仅作为 OOF 诊断候选。当前由于非等权方案存在集中度风险，正式推理仍保持等权。
+`risk_soft`、`score_soft`、`shrunk_softmax` 等非等权策略仅作为 OOF 诊断候选。当前正式推理保持等权。`nofilter`、非等权和 stable top30 二阶段重排均做过诊断，未进入正式提交逻辑。
 
 ## 训练流程
 
@@ -149,7 +151,7 @@ uv run python app/code/src/test.py
 4. 加载 Transformer 和 LightGBM 产物。
 5. 分别计算 Transformer 分数和 LightGBM 分数。
 6. 对两个分支分数做横截面 z-score，并按 `0.30 / 0.70` 融合。
-7. 使用 `stable` 过滤候选股票。
+7. 使用 `stable` 过滤候选股票，当前阈值为流动性分位 `0.10`、波动率分位 `0.85`。
 8. 选 Top5 并等权输出。
 9. 写入 `output/result.csv`。
 
@@ -157,9 +159,9 @@ uv run python app/code/src/test.py
 
 ```csv
 stock_id,weight
-002463,0.2
-600362,0.2
 600015,0.2
+601018,0.2
+601077,0.2
 002384,0.2
 300274,0.2
 ```
@@ -167,10 +169,10 @@ stock_id,weight
 本地固定规则后记录分数：
 
 ```text
-score_self.py = 0.09631811495423051
+score_self.py = 0.09719554955415999
 ```
 
-该分数只作为固定方案后的本地记录，不能用于反向调参。
+该分数为当前固定提交规则后的本地记录。`data/test.csv` 的未来收益只用于本地评分脚本记录，不进入模型训练、推理特征或提交逻辑。
 
 ## 常用命令
 
@@ -196,9 +198,9 @@ uv run python test\score_self.py
 脚本入口：
 
 ```bash
-sh init.sh
-sh train.sh
-sh test.sh
+bash app/init.sh
+bash app/train.sh
+bash test.sh
 ```
 
 ## Docker 与提交准备
@@ -206,15 +208,24 @@ sh test.sh
 主办方要求镜像名为 `bdc2025`：
 
 ```bash
-docker buildx build --platform linux/amd64 -t bdc2025 .
+docker build -t bdc2025:latest .
+# 或者：
+docker buildx build --platform linux/amd64 -t bdc2025:latest --load .
 docker save -o team_name.tar bdc2025:latest
+```
+
+本地 Docker Compose 已使用镜像名 `bdc2025:latest`，并按官方结构挂载 `app/data`、`app/output`、`app/temp`：
+
+```bash
+docker compose up --no-build app
 ```
 
 容器内训练与推理：
 
 ```bash
-uv run python app/code/src/train.py
-uv run python app/code/src/test.py
+bash app/init.sh
+bash app/train.sh
+bash test.sh
 ```
 
 提交前需要确认：
@@ -250,7 +261,7 @@ uv run python app/code/src/test.py
 |--readme.md
 ```
 
-当前仓库已经提供赛事入口 `app/code/src/train.py`、`app/code/src/test.py`、`app/code/src/featurework.py`。提交前需要进一步确认 shell 脚本位置、Docker 挂载路径和官方 `docker-compose.yml` 完全匹配。
+当前仓库已经提供赛事入口 `app/code/src/train.py`、`app/code/src/test.py`、`app/code/src/featurework.py`，并补齐 `app/data`、`app/model`、`app/output`、`app/temp`、`app/init.sh`、`app/train.sh` 和根目录 `test.sh`。Dockerfile 会将 `app/model` 同步到容器运行目录 `/app/model`，确保只执行推理时也能加载当前模型产物；从零训练时 `app/train.sh` 会重新生成 `model/` 产物。
 
 ## 其他注意事项
 

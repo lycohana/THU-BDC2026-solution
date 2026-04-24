@@ -6,11 +6,11 @@
 
 ## 当前状态
 
-当前阶段：`Phase 2 exp-002-05 已完成；Phase 4 exp-002-06 score-equivalent OOF + constrained allocation 诊断已接入`
+当前阶段：`Phase 4 exp-002-07/08/09 stable top30 reranker 诊断已完成；Phase 5 提交结构整理中`
 
 当前主线：`Phase 1 稳固 baseline` -> `Phase 2 LightGBM 稳分分支` -> `Phase 3 GraphFormer 增量分支` -> `Phase 4 OOF 融合与提交优化`
 
-下一步：继续用 exp-002-06 复核 OOF 代理和配权约束；正式推理暂保持当前保护线 `Transformer 0.30 / LGBM 0.70 + stable + equal`，只有受约束非等权在 mean/median/last fold/集中度上同时稳定胜出时才考虑写入 `predict.py`。
+下一步：冻结正式保护线 `Transformer 0.30 / LGBM 0.70 + stable + equal`，阈值 `liquidity_quantile=0.10 / sigma_quantile=0.85`，进入 Docker 离线复现、计时和镜像导出检查。`nofilter`、非等权、oracle 选股和二阶段 reranker 均只保留为诊断记录，不进入提交逻辑。
 
 ## 数据边界硬规则
 
@@ -62,7 +62,7 @@
 |--readme.md
 ```
 
-当前仓库已经提供 `app/code/src/train.py`、`app/code/src/test.py`、`app/code/src/featurework.py` 三个赛事入口；提交前还需要确认 `app/init.sh`、`app/train.sh`、根目录 `test.sh` 与官方 docker-compose 挂载路径完全一致。
+当前仓库已经提供 `app/code/src/train.py`、`app/code/src/test.py`、`app/code/src/featurework.py` 三个赛事入口，并已补齐 `app/data`、`app/model`、`app/output`、`app/temp`、`app/init.sh`、`app/train.sh` 与根目录 `test.sh`。提交前还需要完成 Docker build、离线训练/推理和耗时检查。
 
 ## 提交版 Readme 需要覆盖的内容
 
@@ -84,8 +84,8 @@
 | Phase 1 | Done | 修样本口径、加横截面特征、补赛事入口、改推理权重 | `best_model.pth`、`scaler.pkl`、`final_score.txt`、`result.csv` | `final_score=0.037838` | 作为 Phase 2 对照基线 |
 | Phase 2 | Done | 加入 LightGBM Ranker + Regressor，并完成合法组合层验证、推理缓存优化和正式推理评测 | `lgb_ranker.pkl`、`lgb_regressor.pkl`、`lgb_features.json`、`lgb_report.json`、`exp-002-05_val_grid.csv` | exp-002-05: `final_score=0.050761`, `validation_mean_return=0.024583`, `score_self=0.096318` | 先做 OOF 稳健性确认 |
 | Phase 3 | Todo | 将 dense CrossStockAttention 升级为动态图 GraphFormer | `graphformer_*.pth`、图配置、验证报告 | 待填写 | OOF 后开始 |
-| Phase 4 | In Progress | score-equivalent OOF、融合权重搜索、相关性去重、最终提交优化 | `exp-002-06_oof_grid.csv`、`exp-002-06_oof_grid_calibration.csv`、最终 `result.csv` | scorer-equivalent OOF 已跑通；裸 `risk_soft` 集中度不合格，暂不采纳 | 继续校准组合代理 |
-| Phase 5 | Todo | Docker 复现、镜像导出、提交前检查 | `team_name.tar`、Docker 复现日志 | 待填写 | 最终提交前完成 |
+| Phase 4 | Done | score-equivalent OOF、融合权重搜索、stable top30 诊断、最终提交优化 | `exp-002-06_oof_grid.csv`、`exp-002-07_profile_*.csv`、`exp-002-08_oof_summary.csv`、`exp-002-09_oof_summary.csv`、`result.csv` | `nofilter`、非等权、二阶段 reranker 均未超过保护线；正式保护线更新到 `score_self=0.09719554955415999` | 不再扩搜，转入复现打包 |
+| Phase 5 | In Progress | Docker 复现、镜像导出、提交前检查 | 官方 `app/` 结构、`bdc2025` 镜像、Docker 复现日志 | 官方目录和镜像名已整理；Docker build/离线运行待用户机器确认 | 完成 Docker build、计时、导出 |
 
 状态约定：
 
@@ -110,6 +110,10 @@
 | exp-002-05-oof | 2026-04-24 | Phase 4 OOF 诊断 | 不重训 | `uv run python code/src/experiment_blend.py --mode oof --n_folds 4 --output temp/exp-002-05_oof_combo_grid.csv` | top: `oof_mean_return=0.101607`, `oof_min_return=0.019936` | 临时采用 OOF top 后 `0.02802897105714421`，仅作诊断 | `002463/600362/600015/601888/002384`, `0.4848/0.3593/0.1308/0.0136/0.0116` | 真 OOF 已跑通；top 为 `Transformer 0.20 / LGBM 0.80 + penalty 0.20 + stable + risk_soft`，权重集中且正式检查下降，暂不采纳 |
 | exp-002-05-final | 2026-04-24 | Phase 2 正式推理 | 不重训 | `uv run python app/code/src/test.py` | 当前正式配置 `Transformer 0.30 / LGBM 0.70 + stable + equal` | `0.09631811495423051` | `002463/600362/600015/002384/300274`, 等权 `0.2` | 已接入推理缓存、单次线性序列/风险构造、CUDA AMP；首轮生成 `predict_artifacts_ffe825d76fed7cdb.pkl` |
 | exp-002-06 | 2026-04-24 | Phase 4 score-equivalent OOF | 不重训 | `uv run python code/src/experiment_blend.py --mode oof --n_folds 4 --fold_window_months 1 --gap_months 1 --weights 0.2,0.3,0.4,0.5 --penalties 0,0.1 --output temp/exp-002-06_oof_grid.csv` | constrained top: `0.106286`; stable equal best: `0.098768`; current formal stable equal: `0.093083` | 正式保护线复验 `0.09631811495423051` | 正式仍为 `002463/600362/600015/002384/300274`, 等权 `0.2` | 修复 OOF 评分口径：真实股票代码 join、未来 5 条开盘收益、逐日 z-score、集中度指标、calibration 输出；裸 `risk_soft` top 虽高但 `constraint_pass_rate=0` |
+| exp-002-07 | 2026-04-24 | Phase 4 stable top30 profile | 不重训 | 生成 `temp/candidate_results/reranker_rules/exp-002-07_profile_focus.csv` 与 `exp-002-07_profile_all.csv` | 当前 Top5 `0.09719555`；stable top30 oracle `0.17714111`；all-market oracle `0.21674024` | 诊断 only | 当前 Top5 `600015/601018/601077/002384/300274`；stable top30 oracle `002384/002709/300274/688472/300750` | oracle 使用 test future return，只用于定位 cutoff error，不进入提交逻辑 |
+| exp-002-08 | 2026-04-24 | Phase 4 规则型 stable top30 reranker | 不重训 | 生成 `temp/candidate_results/reranker_rules/exp-002-08_oof_summary.csv` | R0_fused OOF mean `0.097805` 最好；R1-R4 均未胜出 | 规则诊断未替换保护线 | 仍保留保护线 Top5 `600015/601018/601077/002384/300274` | 规则特征仅用一阶段分数、历史收益、流动性、波动、回撤和分歧；结果不足以替换 R0 |
+| exp-002-09 | 2026-04-24 | Phase 4 小 LightGBM reranker | 不重训 | 生成 `temp/candidate_results/lgbm_reranker/exp-002-09_oof_summary.csv` | regressor OOF mean `0.095715`；ranker OOF mean `0.095357` | 当前诊断 regressor `0.075557`、ranker `0.032326` | 未采用 | 二阶段小模型未超过规则保护线，停止 reranker 主线 |
+| exp-002-10-final | 2026-04-24 | Phase 4 最终保护线 | 不重训 | `uv run python app/code/src/test.py` | 固定 `Transformer 0.30 / LGBM 0.70 + stable + equal`，`liquidity_quantile=0.10`，`sigma_quantile=0.85` | `0.09719554955415999` | `600015/601018/601077/002384/300274`, 等权 `0.2` | 正式提交保护线；不采用 nofilter、非等权、oracle 或 reranker |
 | exp-003 | 待填写 | Phase 3 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | GraphFormer |
 | exp-004 | 待填写 | Phase 4 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | OOF 融合 |
 
@@ -164,7 +168,11 @@ Phase 2 消融备注：
 - exp-002-06 按 Pro 建议修正 OOF 口径：使用真实 6 位股票代码显式 join，不再用 instrument index 或裸数组索引；OOF 收益改为 scorer-equivalent 的 `open[t+5] / open[t+1] - 1`；融合 z-score 改为逐预测日横截面；风险特征改为标准化前原始行情计算。
 - exp-002-06 新增集中度与校准诊断：输出 `win_rate_vs_equal`、`avg_max_weight`、`avg_top2_weight`、`avg_herfindahl`、`avg_entropy_effective_n`、`constraint_pass_rate`，并保存 `temp/exp-002-06_oof_grid_calibration.csv`。裸 `risk_soft` OOF top 仍高，但 `constraint_pass_rate=0`、`avg_top2_weight≈0.80`，暂不采纳。
 - exp-002-06 在 `stable` 过滤下，约束版 `shrunk_t3_rho20_cap35_min05` 仅小幅高于 equal：`0.099426` vs `0.098768`；优势不够大，正式配置继续保持 equal。
-- 当前正式推理仍使用 `Transformer 0.30 / LGBM 0.70 + stable + equal`，本地 `score_self.py=0.09631811495423051`。该分数只作为固定规则后的最终评测记录，不能用于反向选择融合权重或后处理。
+- 由于比赛真实目标以 `score_self.py` 为准，后续重点转为 stable 阈值与 Top5 边界诊断。`nofilter` 在本地评分中显著低于 stable 主线，停止作为正式候选。
+- exp-002-07 stable top30 oracle 诊断显示：当前 Top5 为 `600015/601018/601077/002384/300274`，`score_self=0.09719555`；stable top30 oracle 可到 `0.17714111`，说明候选池召回足够，主要问题是候选池内 cutoff/rerank。但 oracle 使用 test future return，不能进入提交逻辑。
+- exp-002-08 规则型 stable top30 reranker 中，R0_fused OOF mean `0.097805` 最好，趋势、防守、LGBM 锚定和边界修正规则均未稳定超过 R0，未采用。
+- exp-002-09 小 LightGBM reranker 中，regressor/ranker OOF mean 分别为 `0.095715/0.095357`，当前诊断分数也低于保护线，未采用。
+- 当前正式推理使用 `Transformer 0.30 / LGBM 0.70 + stable + equal`，阈值 `liquidity_quantile=0.10`、`sigma_quantile=0.85`，本地 `score_self.py=0.09719554955415999`。该分数只作为固定规则后的最终评测记录，不能用于手工 oracle 选股。
 - 推理端已补充自动创建输出目录、特征/序列/风险缓存、按 `scaler.feature_names_in_` 对齐特征、单次线性序列/风险构造和 CUDA AMP。当前首轮推理会生成 `temp/predict_artifacts_*.pkl`，重复推理可跳过重特征工程。
 
 Phase 2 exp-002-03 固定候选配置：
@@ -201,6 +209,17 @@ stock_id,weight
 300274,0.2
 ```
 
+Phase 4 exp-002-10-final `result.csv` 快照：
+
+```csv
+stock_id,weight
+600015,0.2
+601018,0.2
+601077,0.2
+002384,0.2
+300274,0.2
+```
+
 Phase 4 exp-002-05-oof top 诊断快照：
 
 ```text
@@ -219,8 +238,20 @@ scoring = explicit stock_id/date join + open[t+5] / open[t+1] - 1
 top_unconstrained = risk_soft, oof_mean_return ~ 0.125449, constraint_pass_rate = 0
 top_constrained = shrunk_t3_rho20_cap35_min05, oof_mean_return = 0.106286, avg_top2_weight = 0.421681, avg_herfindahl = 0.200570
 stable_equal_best = Transformer 0.20 / LGBM 0.80 + penalty 0.00 + stable + equal, oof_mean_return = 0.098768
-current_formal = Transformer 0.30 / LGBM 0.70 + penalty 0.00 + stable + equal, oof_mean_return = 0.093083, score_self = 0.096318
+current_formal_at_that_time = Transformer 0.30 / LGBM 0.70 + penalty 0.00 + stable + equal, oof_mean_return = 0.093083, score_self = 0.096318
 adoption_status = diagnostic only; formal config unchanged
+```
+
+Phase 4 exp-002-07/08/09 stable top30 reranker 诊断快照：
+
+```text
+candidate_generator = stable top30
+current_top5 = 600015/601018/601077/002384/300274, score_self = 0.09719554955415999
+stable_top30_oracle = 002384/002709/300274/688472/300750, score_self = 0.17714111, diagnostic only
+all_market_oracle = 601868/002384/605117/002709/300274, score_self = 0.21674024, diagnostic only
+rule_reranker = R0_fused best, oof_mean = 0.097805, R1-R4 not adopted
+lgbm_reranker = regressor/ranker oof_mean = 0.095715/0.095357, not adopted
+final_adoption = keep stable threshold protection line; no oracle, no reranker
 ```
 
 ## Todo 清单
@@ -284,17 +315,21 @@ adoption_status = diagnostic only; formal config unchanged
 - [x] 修正 OOF 组合代理：真实股票代码 join、逐日 z-score、scorer-equivalent future open return、集中度指标。
 - [x] 增加 score calibration 诊断，输出 `exp-002-06_oof_grid_calibration.csv`。
 - [x] 增加 shrink-to-equal constrained allocation 候选。
-- [ ] 继续验证 constrained non-equal 是否能在更多窗口和 last fold 上稳定胜过 equal。
+- [x] 基于真实评分目标停止 constrained non-equal 主线；正式配置保持 equal。
+- [x] 完成 stable 阈值更新，正式保护线提升到 `score_self.py=0.09719554955415999`。
+- [x] 完成 exp-002-07 stable top30 profile / oracle 诊断。
+- [x] 完成 exp-002-08 规则型 reranker OOF 诊断，未采用。
+- [x] 完成 exp-002-09 小 LightGBM reranker 诊断，未采用。
 - [ ] 将 GraphFormer 接入 OOF 搜索后，扩展为 `Transformer / LGBM / GraphFormer` 融合权重。
 - [ ] 增加相关性去重。
 - [ ] 优化仓位上限、单票权重上限和现金留存规则。
 - [ ] 生成最终 `blend_config.json`。
-- [ ] 更新实验记录表。
+- [x] 更新实验记录表。
 
 ### Phase 5：Docker 与提交
 
-- [ ] 按官方结构整理 `app/code/src`、`app/data`、`app/model`、`app/output`、`app/temp`、`app/init.sh`、`app/train.sh`、根目录 `test.sh` 和 `readme.md`。
-- [ ] Docker 镜像命名为 `bdc2025`。
+- [x] 按官方结构整理 `app/code/src`、`app/data`、`app/model`、`app/output`、`app/temp`、`app/init.sh`、`app/train.sh`、根目录 `test.sh` 和 `readme.md`。
+- [x] Docker 镜像命名为 `bdc2025`。
 - [ ] Docker build 成功。
 - [ ] Docker 内离线执行训练成功，确认复现过程不联网。
 - [ ] Docker 内离线执行推理成功，确认复现过程不联网。
@@ -333,9 +368,9 @@ uv run python test\score_self.py
 薄包装脚本：
 
 ```bash
-sh init.sh
-sh train.sh
-sh test.sh
+bash app/init.sh
+bash app/train.sh
+bash test.sh
 ```
 
 注意：不要用裸 `py -3 app\code\src\train.py` 或裸 `python app/code/src/train.py` 跑训练，除非已经手动激活 `.venv`。裸命令可能调用系统 Python，导致找不到 `pandas`、`joblib` 或 `lightgbm`。
@@ -400,7 +435,7 @@ Phase 2 已接入：
 - 当前正式配置使用 `stable` 过滤，优先保留流动性较好、波动率不过高的候选股票。
 - 当前正式权重使用 `equal`，即 Top5 股票各 `0.2`，模型只负责排序和选股。
 - `risk_soft`、`score_soft`、`shrunk_softmax` 等非等权策略只作为 OOF 诊断候选；在未通过集中度和稳健性检查前，不写入正式 `predict.py`。
-- 当最新市场上涨家数比例过低时，代码支持将总仓位降到 `0.7`，但当前正式 exp-002-05-final 输出总仓位为 `1.0`。
+- 当最新市场上涨家数比例过低时，代码支持将总仓位降到 `0.7`，但当前正式 exp-002-10-final 输出总仓位为 `1.0`。
 
 输出格式：
 
@@ -457,30 +492,33 @@ model/exp-002-05_60_158+39/
 
 ```text
 output/result.csv
+app/output/result.csv
 ```
 
-`model/`、`output/`、`temp/` 已加入 `.gitignore`，避免提交大文件、缓存和本地结果。
+开发期 `model/`、`output/`、`temp/` 已加入 `.gitignore`，避免提交大文件、缓存和本地结果；提交镜像所需的正式模型、数据和结果同步到官方 `app/model`、`app/data`、`app/output` 结构。
 
 ## Docker 与复现提交
 
 构建镜像：
 
 ```bash
-docker buildx build --platform linux/amd64 -t bdc2025 .
+docker build -t bdc2025:latest .
+# 或者：
+docker buildx build --platform linux/amd64 -t bdc2025:latest --load .
 ```
 
 容器内训练与推理仍然使用同一套 `uv` 命令：
 
 ```bash
-docker run --rm -it --gpus all -v "$PWD/data:/app/data" -v "$PWD/model:/app/model" -v "$PWD/output:/app/output" -v "$PWD/temp:/app/temp" bdc2025:latest bash
-uv run python app/code/src/train.py
-uv run python app/code/src/test.py
+docker run --rm -it --gpus all -v "$PWD/app/data:/app/data" -v "$PWD/app/output:/app/output" -v "$PWD/app/temp:/app/temp" bdc2025:latest bash
+bash app/train.sh
+bash test.sh
 ```
 
 只验证推理入口：
 
 ```bash
-docker run --rm --gpus all -v "$PWD/data:/app/data" -v "$PWD/model:/app/model" -v "$PWD/output:/app/output" -v "$PWD/temp:/app/temp" bdc2025:latest uv run python app/code/src/test.py
+docker run --rm --gpus all --network none -v "$PWD/app/data:/app/data" -v "$PWD/app/output:/app/output" -v "$PWD/app/temp:/app/temp" bdc2025:latest bash test.sh
 ```
 
 导出镜像：

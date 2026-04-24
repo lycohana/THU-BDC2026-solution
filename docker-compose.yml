@@ -1,11 +1,11 @@
 services:
   app:
-    image: bdc2026:latest
+    image: bdc2025:latest
     pull_policy: never
     volumes:
-      - ./data:/app/data
-      - ./test/output:/app/output
-      - ./temp:/app/temp
+      - ./app/data:/app/data
+      - ./app/output:/app/output
+      - ./app/temp:/app/temp
     working_dir: /app
     command: bash -lc "uv run python app/code/src/test.py"
     runtime: nvidia

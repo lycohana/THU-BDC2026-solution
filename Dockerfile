@@ -27,13 +27,18 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /app
 
 # Copy dependency files
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock readme.md ./
 
 # Install dependencies
 RUN uv sync --frozen
 
 # Copy the application code
 COPY . .
+
+# The official package keeps model artifacts under app/model. Runtime code
+# resolves models from /app/model, so mirror them into the runtime root.
+RUN if [ -d app/model ] && [ ! -d model ]; then cp -a app/model ./model; fi && \
+    mkdir -p /app/data /app/model /app/output /app/temp
 
 # Set environment to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"

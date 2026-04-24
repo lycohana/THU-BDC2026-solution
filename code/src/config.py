@@ -33,7 +33,7 @@ config = {
     'postprocess': {
         'filter': 'stable',
         'weighting': 'equal',
-        'liquidity_quantile': 0.20,
+        'liquidity_quantile': 0.10,
         'sigma_quantile': 0.85,
     },
     'lgb': {
