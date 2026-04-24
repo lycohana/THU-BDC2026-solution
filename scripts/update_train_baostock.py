@@ -267,12 +267,13 @@ def main():
     parser.add_argument(
         "--socket-timeout",
         type=float,
-        default=30.0,
-        help="BaoStock socket 连接和接收超时时间，单位秒。",
+        default=0.0,
+        help="BaoStock socket 连接和接收超时时间，单位秒；0 表示不改 BaoStock 默认 socket 行为。",
     )
     args = parser.parse_args()
 
-    install_socket_timeout(args.socket_timeout)
+    if args.socket_timeout > 0:
+        install_socket_timeout(args.socket_timeout)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
