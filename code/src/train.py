@@ -696,7 +696,7 @@ def main():
                 print(f"保存最佳模型 - final score: {best_score:.4f}")
         print(f"\n训练完成！最佳 epoch: {best_epoch}, 最佳 final score: {best_score:.4f}")
         with open(os.path.join(output_dir, 'final_score.txt'), 'w') as f:
-            f.write(f"Best epoch: {best_epoch}\\nBest final_score: {best_score:.6f}\\n")
+            f.write(f"Best epoch: {best_epoch}\nBest final_score: {best_score:.6f}\n")
 
         if writer:
             writer.close()

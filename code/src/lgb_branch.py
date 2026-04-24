@@ -439,6 +439,7 @@ def predict_lgb_score(lgb_bundle, feature_df, cfg):
     X = _clean_feature_frame(feature_df, feature_cols)
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message="Found 'eval_at' in params.*")
+        warnings.filterwarnings('ignore', message="Found 'ndcg_eval_at' in params.*")
         rank_score = lgb_bundle['ranker'].predict(X)
         reg_score = lgb_bundle['regressor'].predict(X)
     return (

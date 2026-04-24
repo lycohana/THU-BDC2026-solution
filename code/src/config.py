@@ -28,6 +28,7 @@ config = {
     'blend': {
         'transformer_weight': 0.30,
         'lgb_weight': 0.70,
+        'agreement_penalty': 0.00,
     },
     'postprocess': {
         'filter': 'stable',
@@ -63,6 +64,13 @@ config = {
         'add_industry_neutral': False,  # 行业中性化
         'add_more_momentum': True,      # 更多动量特征 (ret3, ret7, ret15)
         'add_amount_change': True,      # 成交额相对变化
+    },
+    'predict': {
+        'feature_workers': 6,
+        'use_cache': True,
+        'cache_dir': './temp',
+        'cache_compress': 3,
+        'amp': True,
     },
     'seed': 42,
 }

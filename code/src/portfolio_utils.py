@@ -2,6 +2,16 @@ import numpy as np
 import pandas as pd
 
 
+def normalize_stock_id(value):
+    """Return scorer-compatible 6 digit stock id strings."""
+    if pd.isna(value):
+        return value
+    text = str(value).strip()
+    if text.endswith('.0'):
+        text = text[:-2]
+    return text.zfill(6)
+
+
 def _zscore(x):
     x = np.asarray(x, dtype=np.float64)
     return (x - x.mean()) / (x.std() + 1e-9)
@@ -88,6 +98,29 @@ def score_soft_weight_portfolio(score_df, k=5, tau=1.0, min_weight=0.05, max_wei
     score = _zscore(top['score'].to_numpy(dtype=np.float64))
     raw_weight = np.exp(score / tau)
     weights = _project_with_bounds(raw_weight, exposure_cap=exposure_cap, min_weight=min_weight, max_weight=max_weight)
+    return _to_weight_frame(top, weights)
+
+
+def shrunk_score_soft_weight_portfolio(
+    score_df,
+    k=5,
+    temperature=3.0,
+    rho=0.20,
+    min_weight=0.05,
+    max_weight=0.35,
+    exposure_cap=1.0,
+):
+    """Softmax weights shrunk toward equal weights to avoid over-trusting score scale."""
+    top = _topk(score_df, k=k)
+    if len(top) == 0:
+        return top.assign(weight=pd.Series(dtype=float))
+
+    score = _zscore(top['score'].to_numpy(dtype=np.float64))
+    raw = np.exp(score / max(float(temperature), 1e-6))
+    soft = raw / (raw.sum() + 1e-12) * exposure_cap
+    equal = np.full(len(top), exposure_cap / len(top), dtype=np.float64)
+    mixed = (1.0 - float(rho)) * equal + float(rho) * soft
+    weights = _project_with_bounds(mixed, exposure_cap=exposure_cap, min_weight=min_weight, max_weight=max_weight)
     return _to_weight_frame(top, weights)
 
 
@@ -202,6 +235,16 @@ def build_weight_portfolio(score_df, weighting_name, k=5, exposure_cap=1.0):
         'score_soft': score_soft_weight_portfolio,
         'score_risk_soft': score_risk_soft_weight_portfolio,
         'inv_vol': inv_vol_weight_portfolio,
+        'shrunk_softmax': shrunk_score_soft_weight_portfolio,
+        'shrunk_t2_rho10_cap30_min05': lambda df, k=5, exposure_cap=1.0: shrunk_score_soft_weight_portfolio(
+            df, k=k, exposure_cap=exposure_cap, temperature=2.0, rho=0.10, max_weight=0.30, min_weight=0.05
+        ),
+        'shrunk_t3_rho20_cap35_min05': lambda df, k=5, exposure_cap=1.0: shrunk_score_soft_weight_portfolio(
+            df, k=k, exposure_cap=exposure_cap, temperature=3.0, rho=0.20, max_weight=0.35, min_weight=0.05
+        ),
+        'shrunk_t5_rho30_cap35_min08': lambda df, k=5, exposure_cap=1.0: shrunk_score_soft_weight_portfolio(
+            df, k=k, exposure_cap=exposure_cap, temperature=5.0, rho=0.30, max_weight=0.35, min_weight=0.08
+        ),
     }
     if weighting_name not in weighting_map:
         raise ValueError(f'Unsupported weighting_name: {weighting_name}')
@@ -210,3 +253,60 @@ def build_weight_portfolio(score_df, weighting_name, k=5, exposure_cap=1.0):
 
 def weights_df_to_selection(weights_df):
     return list(zip(weights_df['stock_id'].tolist(), weights_df['weight'].tolist()))
+
+
+def portfolio_metrics(weights_df):
+    weights = weights_df['weight'].to_numpy(dtype=np.float64) if len(weights_df) else np.array([], dtype=np.float64)
+    if weights.size == 0:
+        return {
+            'max_weight': 0.0,
+            'top2_weight': 0.0,
+            'herfindahl': 0.0,
+            'entropy_effective_n': 0.0,
+        }
+    sorted_weights = np.sort(weights)[::-1]
+    herfindahl = float(np.sum(np.square(weights)))
+    positive = weights[weights > 1e-12]
+    entropy = -float(np.sum(positive * np.log(positive)))
+    return {
+        'max_weight': float(sorted_weights[0]),
+        'top2_weight': float(sorted_weights[:2].sum()) if sorted_weights.size >= 2 else float(sorted_weights.sum()),
+        'herfindahl': herfindahl,
+        'entropy_effective_n': float(np.exp(entropy)),
+    }
+
+
+def add_forward_open_returns(raw_df, horizon=5, date_col='日期', stock_col='股票代码', open_col='开盘'):
+    """Build scorer-equivalent future return: open[t+horizon] / open[t+1] - 1."""
+    data = raw_df[[stock_col, date_col, open_col]].copy()
+    data[stock_col] = data[stock_col].map(normalize_stock_id)
+    data[date_col] = pd.to_datetime(data[date_col])
+    data = data.sort_values([stock_col, date_col]).reset_index(drop=True)
+    grouped_open = data.groupby(stock_col, sort=False)[open_col]
+    data['open_t1'] = grouped_open.shift(-1)
+    data[f'open_t{horizon}'] = grouped_open.shift(-horizon)
+    data['forward_open_return'] = (
+        data[f'open_t{horizon}'] - data['open_t1']
+    ) / (data['open_t1'] + 1e-12)
+    return data.rename(columns={stock_col: 'stock_id', date_col: 'date'})[
+        ['stock_id', 'date', 'forward_open_return']
+    ].dropna(subset=['forward_open_return'])
+
+
+def score_portfolio_like_scorer(weights_df, forward_return_df, date):
+    """Score a portfolio by explicit stock_id/date join instead of positional arrays."""
+    if len(weights_df) == 0:
+        empty = weights_df.copy()
+        empty['forward_open_return'] = pd.Series(dtype=float)
+        empty['weighted_return'] = pd.Series(dtype=float)
+        return 0.0, empty
+
+    weights = weights_df.copy()
+    weights['stock_id'] = weights['stock_id'].map(normalize_stock_id)
+    date = pd.Timestamp(date)
+    returns = forward_return_df[forward_return_df['date'] == date][['stock_id', 'forward_open_return']].copy()
+    returns['stock_id'] = returns['stock_id'].map(normalize_stock_id)
+    merged = weights.merge(returns, on='stock_id', how='left')
+    merged['forward_open_return'] = merged['forward_open_return'].fillna(0.0)
+    merged['weighted_return'] = merged['weight'].astype(float) * merged['forward_open_return'].astype(float)
+    return float(merged['weighted_return'].sum()), merged
