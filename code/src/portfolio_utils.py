@@ -272,11 +272,11 @@ def stable_topk_rerank_filter(
         negative_ret20_penalty = (ret20_raw < 0.0).astype(float).to_numpy(dtype=np.float64)
         rerank_score = (
             0.30 * fused
+            + 0.10 * lgb
             + 0.30 * log_liquidity
             + 0.10 * ret5
             + 0.10 * ret20
-            - 0.05 * sigma
-            - 0.15 * amp
+            - 0.10 * amp
             - 0.50 * negative_ret20_penalty
         )
     else:
