@@ -447,6 +447,8 @@ def main():
     weighting_name = post_cfg.get('weighting', 'equal')
     output_df = build_weight_portfolio(filtered, weighting_name, exposure_cap=exposure_cap)
     output_df.to_csv(output_path, index=False)
+    score_df.sort_values('score', ascending=False).to_csv('./temp/predict_score_df.csv', index=False)
+    filtered.head(30).to_csv('./temp/predict_filtered_top30.csv', index=False)
 
     print(f'[BDC][predict] date={latest_date.date()}')
     print(f'[BDC][predict] ranked_stocks={len(score_df)}')

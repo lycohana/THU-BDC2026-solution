@@ -268,6 +268,8 @@ def stable_topk_rerank_filter(
     elif variant == 'lgb_anchor':
         rerank_score = 0.45 * lgb + 0.25 * fused + 0.10 * transformer + 0.10 * ret20 + 0.05 * liquidity - 0.10 * sigma
     elif variant == 'liquidity_risk_off':
+        ret20_raw = out.get('ret20', pd.Series(0.0, index=out.index)).astype(float)
+        negative_ret20_penalty = (ret20_raw < 0.0).astype(float).to_numpy(dtype=np.float64)
         rerank_score = (
             0.30 * fused
             + 0.30 * log_liquidity
@@ -275,6 +277,7 @@ def stable_topk_rerank_filter(
             + 0.10 * ret20
             - 0.05 * sigma
             - 0.15 * amp
+            - 0.50 * negative_ret20_penalty
         )
     else:
         rerank_score = 0.55 * fused + 0.15 * lgb + 0.10 * transformer + 0.10 * ret20 + 0.05 * liquidity - 0.10 * sigma - 0.05 * disagreement
@@ -334,7 +337,7 @@ def apply_filter(score_df, filter_name, liquidity_quantile=0.20, sigma_quantile=
         if _is_extreme_risk_off(score_df):
             return stable_topk_rerank_filter(
                 score_df,
-                k=30,
+                k=60,
                 liquidity_quantile=liquidity_quantile,
                 sigma_quantile=sigma_quantile,
                 variant='liquidity_risk_off',
