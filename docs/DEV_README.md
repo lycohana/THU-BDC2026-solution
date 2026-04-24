@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-当前阶段：`Phase 5 score-first 提交候选已冻结；Docker 复现与提交打包检查中`
+当前阶段：`Phase 5 exp-002-11-final 完整训练复现已通过；Docker/提交打包检查中`
 
 当前主线：`Phase 1 稳固 baseline` -> `Phase 2 LightGBM 稳分分支` -> `Phase 3 GraphFormer 增量分支` -> `Phase 4 OOF 融合与提交优化`
 
@@ -16,11 +16,11 @@
 
 ```csv
 stock_id,weight
-300274,0.2
 002384,0.2
+300274,0.2
 600015,0.2
-601077,0.2
 300750,0.2
+601077,0.2
 ```
 
 当前本地分数：
@@ -31,7 +31,21 @@ score_self.py = 0.12018139687305522
 
 回滚保护线：`Transformer 0.30 / LGBM 0.70 + stable + equal`，分数 `0.09719554955415999`，文件 `temp/result_protection_stable_equal_20260425.csv`。
 
-下一步：冻结当前高分候选，进入 Docker 离线复现、计时和镜像导出检查。停止继续围绕当前 `score_self` 做新一轮搜索；`nofilter`、非等权、oracle 选股、Top5-heavy 直接替换和旧二阶段 reranker 均只保留为诊断记录，不进入提交逻辑。
+完整训练复现记录：
+
+```text
+uv sync --frozen
+uv run python app/code/src/train.py
+uv run python app/code/src/test.py
+uv run python test/score_self.py
+
+Best epoch = 8
+Best final_score = 0.050761
+score_self.py = 0.12018139687305522
+local full runtime ≈ 34m53s
+```
+
+下一步：进入 Docker 离线复现、计时和镜像导出检查。停止继续围绕当前 `score_self` 做新一轮搜索；`nofilter`、非等权、oracle 选股、Top5-heavy 直接替换和旧二阶段 reranker 均只保留为诊断记录，不进入提交逻辑。
 
 ## 数据边界硬规则
 
@@ -68,8 +82,8 @@ score_first + leakage guardrail + complexity guardrail
 当前方案合规状态：
 
 - 当前主线只使用官方 `train.csv/test.csv`，不使用外部公开数据、预训练模型、词典或 embedding；因此当前无需报备外部资源。
-- 当前正式推理已接入缓存和 AMP，重复推理通常远低于 `5` 分钟；提交前仍需在指定机器或近似机器上重新计时。
-- 当前训练需在更新数据库后重跑并记录耗时；若接近 `8` 小时上限，需要压缩搜索空间或关闭非必要实验分支。
+- 当前正式推理已接入缓存和 AMP，完整训练后的本地推理远低于 `5` 分钟。
+- 当前本地完整训练复现耗时约 `34m53s`，显著低于 `8` 小时上限；虚拟机记录约 `27m` 量级。
 - `test/score_self.py` 只作为最终比赛分数近似闸门；当前已完成 GPT Pro 审核、leakage audit 和阈值敏感性检查后冻结，不再继续围绕该脚本迭代。
 
 ## 官方提交结构
@@ -119,7 +133,7 @@ score_first + leakage guardrail + complexity guardrail
 | Phase 2 | Done | 加入 LightGBM Ranker + Regressor，并完成合法组合层验证、推理缓存优化和正式推理评测 | `lgb_ranker.pkl`、`lgb_regressor.pkl`、`lgb_features.json`、`lgb_report.json`、`exp-002-05_val_grid.csv` | exp-002-05: `final_score=0.050761`, `validation_mean_return=0.024583`, `score_self=0.096318` | 先做 OOF 稳健性确认 |
 | Phase 3 | Todo | 将 dense CrossStockAttention 升级为动态图 GraphFormer | `graphformer_*.pth`、图配置、验证报告 | 待填写 | OOF 后开始 |
 | Phase 4 | Done | score-equivalent OOF、融合权重搜索、stable top30 诊断、Top5-heavy 分支和 reranker 诊断 | `exp-002-06_oof_grid.csv`、`exp-002-07_profile_*.csv`、`exp-002-08_oof_summary.csv`、`exp-002-09_oof_summary.csv`、`lgb_ranker_top5_v*.pkl` | `nofilter`、非等权、Top5-heavy 直接替换和二阶段 reranker 均未超过最终候选；旧保护线为 `score_self=0.09719554955415999` | 停止扩搜 |
-| Phase 5 | In Progress | score-first 最终候选、Docker 复现、镜像导出、提交前检查 | `regime_liquidity_risk_off`、`output/result.csv`、`gptpro_score_first_audit_20260425.md`、官方 `app/` 结构 | 当前正式候选 `score_self=0.12018139687305522`；leakage audit 与 risk_off 阈值敏感性已通过 | 完成 Docker build、计时、导出 |
+| Phase 5 | In Progress | score-first 最终候选、完整训练复现、Docker 复现、镜像导出、提交前检查 | `regime_liquidity_risk_off`、`output/result.csv`、`docs/EXP_002_11_FINAL_REPORT.md`、官方 `app/` 结构 | 完整 `train -> predict -> score_self` 已复现 `score_self=0.12018139687305522`；leakage audit 与 risk_off 阈值敏感性已通过 | 完成 Docker build、计时、导出 |
 
 状态约定：
 
@@ -148,7 +162,7 @@ score_first + leakage guardrail + complexity guardrail
 | exp-002-08 | 2026-04-24 | Phase 4 规则型 stable top30 reranker | 不重训 | 生成 `temp/candidate_results/reranker_rules/exp-002-08_oof_summary.csv` | R0_fused OOF mean `0.097805` 最好；R1-R4 均未胜出 | 规则诊断未替换保护线 | 仍保留保护线 Top5 `600015/601018/601077/002384/300274` | 规则特征仅用一阶段分数、历史收益、流动性、波动、回撤和分歧；结果不足以替换 R0 |
 | exp-002-09 | 2026-04-24 | Phase 4 小 LightGBM reranker | 不重训 | 生成 `temp/candidate_results/lgbm_reranker/exp-002-09_oof_summary.csv` | regressor OOF mean `0.095715`；ranker OOF mean `0.095357` | 当前诊断 regressor `0.075557`、ranker `0.032326` | 未采用 | 二阶段小模型未超过规则保护线，停止 reranker 主线 |
 | exp-002-10-final | 2026-04-24 | Phase 4 最终保护线 | 不重训 | `uv run python app/code/src/test.py` | 固定 `Transformer 0.30 / LGBM 0.70 + stable + equal`，`liquidity_quantile=0.10`，`sigma_quantile=0.85` | `0.09719554955415999` | `600015/601018/601077/002384/300274`, 等权 `0.2` | 正式提交保护线；不采用 nofilter、非等权、oracle 或 reranker |
-| exp-002-11-final | 2026-04-25 | Phase 5 score-first 最终候选 | 不重训 | `uv run python code/src/predict.py` | `regime_liquidity_risk_off + equal`，通过 GPT Pro 审核、leakage audit 和 risk_off 阈值敏感性 | `0.12018139687305522` | `300274/002384/600015/601077/300750`, 等权 `0.2` | 当前正式提交；保护线已备份到 `temp/result_protection_stable_equal_20260425.csv` |
+| exp-002-11-final | 2026-04-25 | Phase 5 score-first 最终候选 | `uv run python app/code/src/train.py` | `uv run python app/code/src/test.py` | 完整训练复现通过；`Best epoch=8`, `Best final_score=0.050761`, runtime≈34m53s | `0.12018139687305522` | `002384/300274/600015/300750/601077`, 等权 `0.2` | 当前正式提交；risk-off 使用 stable top60 + fused/lgb/liquidity/momentum/amp/negative_ret20 rerank |
 | exp-003 | 待填写 | Phase 3 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | GraphFormer |
 | exp-004 | 待填写 | Phase 4 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | OOF 融合 |
 
@@ -208,7 +222,7 @@ Phase 2 消融备注：
 - exp-002-08 规则型 stable top30 reranker 中，R0_fused OOF mean `0.097805` 最好，趋势、防守、LGBM 锚定和边界修正规则均未稳定超过 R0，未采用。
 - exp-002-09 小 LightGBM reranker 中，regressor/ranker OOF mean 分别为 `0.095715/0.095357`，当前诊断分数也低于保护线，未采用。
 - exp-002-10 保护线为 `Transformer 0.30 / LGBM 0.70 + stable + equal`，阈值 `liquidity_quantile=0.10`、`sigma_quantile=0.85`，本地 `score_self.py=0.09719554955415999`。该版本已作为回滚文件保留。
-- 当前正式推理使用 `Transformer 0.30 / LGBM 0.70 + regime_liquidity_risk_off + equal`，本地 `score_self.py=0.12018139687305522`。该规则经过 GPT Pro 审核、代码级 leakage audit 和 risk_off 阈值敏感性复核后冻结；后续不再围绕当前 `score_self` 继续迭代。
+- 当前正式推理使用 `Transformer 0.30 / LGBM 0.70 + regime_liquidity_risk_off + equal`，完整 `train -> predict -> score_self` 本地复现 `score_self.py=0.12018139687305522`。该规则经过 GPT Pro 审核、代码级 leakage audit、risk_off 阈值敏感性复核和完整训练复现后冻结；后续不再围绕当前 `score_self` 继续迭代。
 - 推理端已补充自动创建输出目录、特征/序列/风险缓存、按 `scaler.feature_names_in_` 对齐特征、单次线性序列/风险构造和 CUDA AMP。当前首轮推理会生成 `temp/predict_artifacts_*.pkl`，重复推理可跳过重特征工程。
 
 Phase 2 exp-002-03 固定候选配置：
@@ -371,7 +385,7 @@ final_adoption = keep stable threshold protection line; no oracle, no reranker
 - [x] 按官方结构整理 `app/code/src`、`app/data`、`app/model`、`app/output`、`app/temp`、`app/init.sh`、`app/train.sh`、根目录 `test.sh` 和 `readme.md`。
 - [x] Docker 镜像命名为 `bdc2025`。
 - [x] `output/result.csv` 已切换到 `regime_liquidity_risk_off` 高分候选。
-- [x] 本地 `uv run python code/src/predict.py` 可复现 `score_self.py=0.12018139687305522`。
+- [x] 本地完整 `uv run python app/code/src/train.py -> app/code/src/test.py -> test/score_self.py` 可复现 `score_self.py=0.12018139687305522`。
 - [x] 保护线已备份到 `temp/result_protection_stable_equal_20260425.csv`。
 - [ ] Docker build 成功。
 - [ ] Docker 内离线执行训练成功，确认复现过程不联网。
@@ -515,7 +529,7 @@ rerank_score =
 
 - leakage audit 通过：预测链路中没有硬编码 `300750/601018`，没有 `score_self/oracle/contribution/future_return`。
 - risk_off 阈值敏感性通过：81 个邻域阈值中 54 个触发高分方案，触发时 100% 高于保护线；不触发时回退保护线。
-- 当前正式配置可由 `uv run python code/src/predict.py` 复现，`uv run python test/score_self.py` 得到 `0.12018139687305522`。
+- 当前正式配置已由完整 `uv run python app/code/src/train.py -> app/code/src/test.py -> test/score_self.py` 复现，得到 `0.12018139687305522`。
 
 输出格式：
 
