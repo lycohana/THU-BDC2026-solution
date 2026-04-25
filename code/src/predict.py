@@ -1,4 +1,5 @@
 import hashlib
+import itertools
 import json
 import os
 import multiprocessing as mp
@@ -78,6 +79,14 @@ def _resolve_feature_workers(num_groups):
     predict_cfg = config.get('predict', {})
     requested = int(predict_cfg.get('feature_workers', min(6, mp.cpu_count())))
     requested = max(1, requested)
+
+    # 外部环境变量显式限制 worker 数（批处理等并发场景设置以避免 Windows 资源耗尽）
+    env_cap = os.environ.get("BDC_FEATURE_WORKERS")
+    if env_cap is not None:
+        try:
+            requested = min(requested, int(env_cap))
+        except ValueError:
+            pass
 
     # Windows 下多进程启动成本较高，小规模任务时主动收缩 worker 数。
     if num_groups < 64:
@@ -598,6 +607,8 @@ def _score_gap(candidates, score_col='score'):
 def _branch_candidates(score_df, selector_cfg, branch_name, regime=None):
     if branch_name == 'independent_union_rerank':
         return _union_rerank_candidates(score_df, selector_cfg, regime=regime)
+    if branch_name == 'safe_union_2slot':
+        return _safe_union_2slot_candidates(score_df, selector_cfg, regime=regime)
     if branch_name == 'legal_plus_1alpha':
         return _legal_plus_1alpha_candidates(score_df, selector_cfg, regime=regime)
 
@@ -674,6 +685,172 @@ def _within_union_budget(rows, budget):
         and counts['alpha_exception_count'] <= int(budget.get('max_alpha_exception_count', 5))
         and counts['branch_only_alpha_count'] <= int(budget.get('max_branch_only_alpha_count', 5))
     )
+
+
+def _row_float(row, col, default=0.0):
+    value = row.get(col, default)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not np.isfinite(value):
+        return float(default)
+    return value
+
+
+def _combo_constraints(selector_cfg, regime):
+    combo_cfg = selector_cfg.get('union_rerank', {}).get('combo_search', {})
+    configured = combo_cfg.get('constraints', {})
+    out = {
+        'min_stable_count': 0,
+        'min_consensus_count': 0,
+        'max_tail_risk_count': 5,
+        'max_high_vol_count': 5,
+        'max_very_tail_count': 5,
+        'max_very_high_vol_count': 5,
+        'max_branch_only_alpha_count': 5,
+    }
+    out.update(configured.get('default', {}))
+    out.update(configured.get(regime, {}))
+    return out
+
+
+def _combo_objective_weights(selector_cfg, regime):
+    combo_cfg = selector_cfg.get('union_rerank', {}).get('combo_search', {})
+    weights = dict(combo_cfg.get('objective_weights', {}))
+    weights.update(combo_cfg.get('objective_weights_by_regime', {}).get(regime, {}))
+    return weights
+
+
+def _combo_constraints_pass(rows, budget, constraints):
+    if len({str(row.get('stock_id')) for row in rows}) != len(rows):
+        return False
+    if not _within_union_budget(rows, budget):
+        return False
+
+    counts = _selected_counts(rows)
+    limits = {
+        'max_tail_risk_count': 'tail_risk_count',
+        'max_high_vol_count': 'high_vol_count',
+        'max_very_tail_count': 'very_tail_count',
+        'max_very_high_vol_count': 'very_high_vol_count',
+        'max_branch_only_alpha_count': 'branch_only_alpha_count',
+    }
+    for limit_key, count_key in limits.items():
+        if counts[count_key] > int(constraints.get(limit_key, 5)):
+            return False
+    if counts['stable_count'] < int(constraints.get('min_stable_count', 0)):
+        return False
+    if counts['consensus_count'] < int(constraints.get('min_consensus_count', 0)):
+        return False
+    max_alpha_slots = constraints.get('max_alpha_slots')
+    if max_alpha_slots is not None and counts['alpha_exception_count'] > int(max_alpha_slots):
+        return False
+    return True
+
+
+def _combo_objective(rows, weights):
+    k = max(len(rows), 1)
+    counts = _selected_counts(rows)
+    alpha_lcb = np.mean([
+        _row_float(row, 'alpha_lcb', _row_float(row, 'alpha_score', 0.0))
+        for row in rows
+    ])
+    consensus = np.mean([
+        min(_row_float(row, 'consensus_count', 0.0), 3.0) / 3.0
+        for row in rows
+    ])
+    stable_support = 0.70 * np.mean([
+        _row_float(row, 'stable_fill_score', _row_float(row, 'score_legal_minrisk', 0.0))
+        for row in rows
+    ]) + 0.30 * (counts['stable_count'] / k)
+    risk = np.mean([
+        _row_float(row, 'effective_risk_score', _row_float(row, 'risk_score', 0.0))
+        for row in rows
+    ])
+    disagreement = np.mean([
+        _row_float(row, 'rank_disagreement', 0.0)
+        for row in rows
+    ])
+    tail_count = counts['tail_risk_count'] / k
+    high_vol_count = counts['high_vol_count'] / k
+    branch_only_count = counts['branch_only_alpha_count'] / k
+
+    return float(
+        weights.get('alpha_lcb', 1.0) * alpha_lcb
+        + weights.get('consensus', 0.20) * consensus
+        + weights.get('stable_support', 0.15) * stable_support
+        - weights.get('risk', 0.40) * risk
+        - weights.get('disagreement', 0.30) * disagreement
+        - weights.get('tail_count', 0.20) * tail_count
+        - weights.get('high_vol_count', 0.12) * high_vol_count
+        - weights.get('branch_only_count', 0.10) * branch_only_count
+    )
+
+
+def _combo_search_union_pick(pool, selector_cfg, regime, k=5):
+    combo_cfg = selector_cfg.get('union_rerank', {}).get('combo_search', {})
+    if not combo_cfg.get('enabled', False) or len(pool) < k:
+        return None, {'combo_search_enabled': False}
+    if regime in set(combo_cfg.get('disabled_regimes', [])):
+        return None, {
+            'combo_search_enabled': False,
+            'combo_search_disabled_reason': f'disabled_for_{regime}',
+        }
+
+    topn = min(int(combo_cfg.get('topn', 25)), len(pool))
+    sort_cols = [col for col in ['alpha_lcb', 'rerank_score', 'stable_fill_score'] if col in pool.columns]
+    if not sort_cols:
+        sort_cols = ['score']
+    work = pool.sort_values(sort_cols, ascending=[False] * len(sort_cols)).head(topn).copy()
+    records = work.to_dict('records')
+    budget = _union_risk_budget(selector_cfg, regime)
+    constraints = _combo_constraints(selector_cfg, regime)
+    weights = _combo_objective_weights(selector_cfg, regime)
+
+    best_rows = None
+    best_score = -np.inf
+    evaluated = 0
+    feasible = 0
+    for combo in itertools.combinations(records, k):
+        evaluated += 1
+        rows = list(combo)
+        if not _combo_constraints_pass(rows, budget, constraints):
+            continue
+        feasible += 1
+        score = _combo_objective(rows, weights)
+        if score > best_score:
+            best_score = score
+            best_rows = rows
+
+    if best_rows is None:
+        return None, {
+            'combo_search_enabled': True,
+            'combo_search_topn': topn,
+            'combo_search_evaluated': evaluated,
+            'combo_search_feasible': feasible,
+            'combo_search_score': np.nan,
+        }
+
+    best_rows = sorted(
+        best_rows,
+        key=lambda row: (
+            _row_float(row, 'alpha_lcb', _row_float(row, 'alpha_score', 0.0)),
+            _row_float(row, 'stable_fill_score', 0.0),
+            _row_float(row, 'rerank_score', 0.0),
+        ),
+        reverse=True,
+    )
+    for row in best_rows:
+        row['combo_search_score'] = best_score
+        row['selection_method'] = 'combo_search'
+    return best_rows, {
+        'combo_search_enabled': True,
+        'combo_search_topn': topn,
+        'combo_search_evaluated': evaluated,
+        'combo_search_feasible': feasible,
+        'combo_search_score': float(best_score),
+    }
 
 
 def _constrained_union_pick(pool, selector_cfg, regime, k=5):
@@ -943,6 +1120,28 @@ def _union_rerank_candidates(score_df, selector_cfg, regime=None):
     )
     pool['effective_risk_score'] = pool['risk_score'] * np.where(pool['alpha_exception'].astype(bool), 0.45, 1.0)
 
+    lcb_cfg = union_cfg.get('alpha_lcb', {})
+    if lcb_cfg.get('enabled', False):
+        oof_col = lcb_cfg.get('oof_error_col', 'alpha_error_q80')
+        oof_penalty = _safe_numeric(pool, oof_col, default=0.0).clip(lower=0.0)
+        pool['alpha_uncertainty_penalty'] = (
+            float(lcb_cfg.get('base_penalty', 0.015))
+            + float(lcb_cfg.get('uncertainty_weight', 0.055)) * _safe_numeric(pool, 'uncertainty_score', default=0.5)
+            + float(lcb_cfg.get('disagreement_weight', 0.025)) * _safe_numeric(pool, 'rank_disagreement')
+            + float(lcb_cfg.get('risk_weight', 0.020)) * _safe_numeric(pool, 'effective_risk_score')
+            + float(lcb_cfg.get('tail_risk_weight', 0.035)) * pool['tail_risk_flag'].astype(float)
+            + float(lcb_cfg.get('branch_only_weight', 0.025)) * pool['branch_only_alpha_flag'].astype(float)
+            + oof_penalty
+        )
+        pool['alpha_lcb'] = pool['alpha_score'] - pool['alpha_uncertainty_penalty']
+    else:
+        pool['alpha_uncertainty_penalty'] = 0.0
+        pool['alpha_lcb'] = pool['alpha_score']
+    pool['alpha_lcb_z'] = (
+        (pool['alpha_lcb'] - pool['alpha_lcb'].mean())
+        / (pool['alpha_lcb'].std(ddof=0) + 1e-9)
+    )
+
     risk_lambda_cfg = union_cfg.get('risk_lambda', {})
     risk_lambda = float(risk_lambda_cfg.get(regime, risk_lambda_cfg.get('risk_off', 0.75)))
     pool['consensus_bonus'] = 0.03 * np.minimum(pool['consensus_count'], 3.0)
@@ -950,7 +1149,7 @@ def _union_rerank_candidates(score_df, selector_cfg, regime=None):
     pool['defensive_support_bonus'] = 0.06 * pool['safe_branch_support'].astype(float)
     pool['score_disagreement_penalty'] = 0.08 * _safe_numeric(pool, 'rank_disagreement')
     pool['rerank_score'] = (
-        pool['alpha_score']
+        pool['alpha_lcb']
         - risk_lambda * pool['effective_risk_score']
         + pool['consensus_bonus']
         + pool['liquidity_bonus']
@@ -960,8 +1159,13 @@ def _union_rerank_candidates(score_df, selector_cfg, regime=None):
     pool['score'] = pool['rerank_score']
     pool['replacement_reason'] = ''
 
-    selected = _constrained_union_pick(pool, selector_cfg, regime or 'risk_off', k=5)
-    selected = _replace_bad_tail_candidates(selected, pool, selector_cfg, regime or 'risk_off')
+    selected, combo_info = _combo_search_union_pick(pool, selector_cfg, regime or 'risk_off', k=5)
+    if selected is None:
+        selected = _constrained_union_pick(pool, selector_cfg, regime or 'risk_off', k=5)
+        selected = _replace_bad_tail_candidates(selected, pool, selector_cfg, regime or 'risk_off')
+        combo_info.setdefault('selection_method', 'greedy_budget')
+    else:
+        combo_info.setdefault('selection_method', 'combo_search')
     selected_ids = [row['stock_id'] for row in selected]
     selected_score_map = {row['stock_id']: row['rerank_score'] for row in selected}
     selected_reason_map = {row['stock_id']: row.get('replacement_reason', '') for row in selected}
@@ -969,6 +1173,8 @@ def _union_rerank_candidates(score_df, selector_cfg, regime=None):
     pool['final_selected'] = pool['stock_id'].isin(selected_ids)
     pool['replacement_reason'] = pool['stock_id'].map(selected_reason_map).fillna(pool['replacement_reason'])
     pool['union_debug_rank'] = pool['rerank_score'].rank(ascending=False, method='first')
+    for key, value in combo_info.items():
+        pool.attrs[key] = value
     pool.attrs['candidate_debug'] = pool.sort_values('rerank_score', ascending=False).copy()
 
     selected_df = pool[pool['stock_id'].isin(selected_ids)].copy()
@@ -977,7 +1183,150 @@ def _union_rerank_candidates(score_df, selector_cfg, regime=None):
     selected_df = selected_df.sort_values('_selected_order').drop(columns=['_selected_order']).reset_index(drop=True)
     selected_df.attrs['candidate_debug'] = pool.sort_values('rerank_score', ascending=False).copy()
     selected_df.attrs['candidate_pool'] = pool.copy()
+    selected_df.attrs['combo_info'] = combo_info
     return selected_df, branch_cfg
+
+
+def _safe_union_2slot_candidates(score_df, selector_cfg, regime=None):
+    branch_cfg = selector_cfg.get('branches', {}).get('safe_union_2slot', {})
+    gate_cfg = selector_cfg.get('gated_union_rerank', {}).get('safe_union_2slot', {})
+    if not gate_cfg.get('enabled', True):
+        return pd.DataFrame(columns=score_df.columns), branch_cfg
+
+    regime = regime or infer_regime(score_df)[0]
+    _, regime_stats = infer_regime(score_df)
+    veto, veto_reason = _market_hard_veto(regime, regime_stats)
+    if veto:
+        empty = pd.DataFrame(columns=score_df.columns)
+        empty.attrs['safe_union_info'] = {'safe_union_reason': veto_reason}
+        return empty, branch_cfg
+    market_ok, market_reason = _market_enable_gate(regime, regime_stats)
+    if gate_cfg.get('require_market_enable', True) and not market_ok:
+        empty = pd.DataFrame(columns=score_df.columns)
+        empty.attrs['safe_union_info'] = {'safe_union_reason': f'safe_union_{market_reason}'}
+        return empty, branch_cfg
+
+    union_candidates, _ = _union_rerank_candidates(score_df, selector_cfg, regime=regime)
+    pool = union_candidates.attrs.get('candidate_pool') if hasattr(union_candidates, 'attrs') else None
+    if pool is None or len(pool) < 5:
+        empty = pd.DataFrame(columns=score_df.columns)
+        empty.attrs['safe_union_info'] = {'safe_union_reason': 'missing_union_pool'}
+        return empty, branch_cfg
+
+    pool = pool.copy()
+    min_clean = int(gate_cfg.get('min_clean_alpha_count', 2))
+    min_lcb_z = float(gate_cfg.get('min_clean_alpha_lcb_z', 1.25))
+    max_alpha_slots = int(gate_cfg.get('max_alpha_slots', 2))
+    max_disagreement = float(gate_cfg.get('max_best_alpha_disagreement', 0.25))
+
+    clean_alpha_mask = (
+        (pool.get('alpha_exception', pd.Series(False, index=pool.index)).astype(bool) | (_safe_numeric(pool, 'alpha_lcb_z') >= min_lcb_z + 0.35))
+        & (_safe_numeric(pool, 'alpha_lcb_z') >= min_lcb_z)
+        & (pd.to_numeric(pool.get('consensus_count', pd.Series(0.0, index=pool.index)), errors='coerce').fillna(0.0) >= 2.0)
+        & ~pool.get('branch_only_alpha_flag', pd.Series(False, index=pool.index)).astype(bool)
+        & ~pool.get('tail_risk_flag', pd.Series(False, index=pool.index)).astype(bool)
+        & ~pool.get('very_tail_flag', pd.Series(False, index=pool.index)).astype(bool)
+        & ~pool.get('very_high_vol_flag', pd.Series(False, index=pool.index)).astype(bool)
+        & (pd.to_numeric(pool.get('rank_disagreement', pd.Series(1.0, index=pool.index)), errors='coerce').fillna(1.0) <= max_disagreement)
+    )
+    clean_alpha_ids = set(pool.loc[clean_alpha_mask, 'stock_id'].astype(str))
+    if len(clean_alpha_ids) < min_clean:
+        empty = pd.DataFrame(columns=score_df.columns)
+        empty.attrs['safe_union_info'] = {
+            'safe_union_reason': 'insufficient_clean_alpha_lcb',
+            'safe_union_clean_alpha_count': len(clean_alpha_ids),
+        }
+        return empty, branch_cfg
+
+    eligible = pool[
+        clean_alpha_mask
+        | pool.get('stable_candidate', pd.Series(False, index=pool.index)).astype(bool)
+        | pool.get('safe_branch_support', pd.Series(False, index=pool.index)).astype(bool)
+    ].copy()
+    if len(eligible) < 5:
+        empty = pd.DataFrame(columns=score_df.columns)
+        empty.attrs['safe_union_info'] = {'safe_union_reason': 'insufficient_safe_pool'}
+        return empty, branch_cfg
+
+    constraints = {
+        'min_stable_count': int(gate_cfg.get('min_stable_slots', 3)),
+        'min_consensus_count': 2,
+        'max_tail_risk_count': int(gate_cfg.get('max_tail_risk_count', 1)),
+        'max_high_vol_count': int(gate_cfg.get('max_high_vol_count', 1)),
+        'max_very_tail_count': int(gate_cfg.get('max_very_tail_count', 0)),
+        'max_very_high_vol_count': int(gate_cfg.get('max_very_high_vol_count', 0)),
+        'max_branch_only_alpha_count': int(gate_cfg.get('max_branch_only_alpha_count', 0)),
+        'max_alpha_slots': max_alpha_slots,
+    }
+    budget = _union_risk_budget(selector_cfg, regime)
+    budget.update({
+        'max_tail_risk_count': constraints['max_tail_risk_count'],
+        'max_high_vol_count': constraints['max_high_vol_count'],
+        'max_very_tail_count': constraints['max_very_tail_count'],
+        'max_very_high_vol_count': constraints['max_very_high_vol_count'],
+        'max_branch_only_alpha_count': constraints['max_branch_only_alpha_count'],
+    })
+    weights = _combo_objective_weights(selector_cfg, regime)
+    topn = min(int(selector_cfg.get('union_rerank', {}).get('combo_search', {}).get('topn', 25)), len(eligible))
+    eligible = eligible.sort_values(['alpha_lcb', 'stable_fill_score', 'rerank_score'], ascending=False).head(topn)
+
+    best_rows = None
+    best_score = -np.inf
+    evaluated = 0
+    feasible = 0
+    for combo in itertools.combinations(eligible.to_dict('records'), 5):
+        evaluated += 1
+        rows = list(combo)
+        clean_count = sum(str(row.get('stock_id')) in clean_alpha_ids for row in rows)
+        if clean_count < min_clean or clean_count > max_alpha_slots:
+            continue
+        if not _combo_constraints_pass(rows, budget, constraints):
+            continue
+        feasible += 1
+        score = _combo_objective(rows, weights)
+        if score > best_score:
+            best_score = score
+            best_rows = rows
+
+    if best_rows is None:
+        empty = pd.DataFrame(columns=score_df.columns)
+        empty.attrs['safe_union_info'] = {
+            'safe_union_reason': 'no_feasible_safe_combo',
+            'safe_union_evaluated': evaluated,
+            'safe_union_feasible': feasible,
+        }
+        return empty, branch_cfg
+
+    selected_ids = [row['stock_id'] for row in sorted(
+        best_rows,
+        key=lambda row: (
+            str(row.get('stock_id')) in clean_alpha_ids,
+            _row_float(row, 'alpha_lcb', 0.0),
+            _row_float(row, 'stable_fill_score', 0.0),
+        ),
+        reverse=True,
+    )]
+    selected = pool[pool['stock_id'].isin(selected_ids)].copy()
+    selected['_selected_order'] = selected['stock_id'].map({stock_id: idx for idx, stock_id in enumerate(selected_ids)})
+    selected['safe_union_2slot_score'] = (
+        0.70 * _safe_numeric(selected, 'alpha_lcb', default=0.0)
+        + 0.20 * _safe_numeric(selected, 'stable_fill_score', default=0.0)
+        + 0.10 * np.minimum(_safe_numeric(selected, 'consensus_count', default=0.0), 3.0) / 3.0
+        - 0.20 * _safe_numeric(selected, 'effective_risk_score', default=0.0)
+    )
+    selected['score'] = selected['safe_union_2slot_score']
+    selected = selected.sort_values('_selected_order').drop(columns=['_selected_order']).reset_index(drop=True)
+    safe_info = {
+        'safe_union_reason': 'enabled_safe_union_2slot',
+        'safe_union_clean_alpha_count': int(sum(str(stock_id) in clean_alpha_ids for stock_id in selected_ids)),
+        'safe_union_evaluated': evaluated,
+        'safe_union_feasible': feasible,
+        'safe_union_score': float(best_score),
+    }
+    selected.attrs['safe_union_info'] = safe_info
+    selected.attrs['candidate_pool'] = pool.copy()
+    selected.attrs['candidate_debug'] = pool.sort_values('rerank_score', ascending=False).copy()
+    return selected, branch_cfg
 
 
 def _best_clean_alpha_candidate(union_candidates, selector_cfg, regime, regime_stats):
@@ -998,7 +1347,8 @@ def _best_clean_alpha_candidate(union_candidates, selector_cfg, regime, regime_s
         return None, {'legal_plus_reason': 'missing_union_pool'}
 
     pool = pool.copy()
-    full_alpha = _safe_numeric(pool, 'alpha_score')
+    alpha_col = 'alpha_lcb' if 'alpha_lcb' in pool.columns else 'alpha_score'
+    full_alpha = _safe_numeric(pool, alpha_col)
     alpha_z = (full_alpha - full_alpha.mean()) / (full_alpha.std(ddof=0) + 1e-9)
     pool['alpha_score_z'] = alpha_z
 
@@ -1039,11 +1389,13 @@ def _best_clean_alpha_candidate(union_candidates, selector_cfg, regime, regime_s
     if regime in {'risk_off', 'mixed_defensive'} and stable_fill_count < 1:
         return None, {'legal_plus_reason': 'insufficient_stable_support'}
 
-    best = candidates.sort_values(['alpha_score_z', 'alpha_score', 'rerank_score'], ascending=False).iloc[0].copy()
+    sort_cols = ['alpha_score_z', alpha_col, 'rerank_score']
+    best = candidates.sort_values(sort_cols, ascending=False).iloc[0].copy()
     return best, {
         'legal_plus_reason': 'enabled_legal_plus_1alpha',
         'best_alpha_stock': str(best.get('stock_id')),
         'best_alpha_score_z': float(best.get('alpha_score_z', 0.0)),
+        'best_alpha_lcb': float(best.get('alpha_lcb', best.get('alpha_score', 0.0))),
         'best_alpha_consensus_count': float(best.get('consensus_count', 0.0)),
     }
 
@@ -1322,6 +1674,11 @@ def _union_gate_diag(candidates, branch_diag):
     alpha_score = _safe_numeric(top, 'alpha_score')
     full_alpha = _safe_numeric(full_pool, 'alpha_score')
     max_alpha_z = float((alpha_score.max() - full_alpha.mean()) / (full_alpha.std(ddof=0) + 1e-9))
+    alpha_lcb = _safe_numeric(top, 'alpha_lcb', default=float(alpha_score.mean()) if len(alpha_score) else 0.0)
+    full_alpha_lcb = _safe_numeric(full_pool, 'alpha_lcb', default=float(full_alpha.mean()) if len(full_alpha) else 0.0)
+    max_alpha_lcb_z = float((alpha_lcb.max() - full_alpha_lcb.mean()) / (full_alpha_lcb.std(ddof=0) + 1e-9))
+    alpha_lcb_z = _safe_numeric(top, 'alpha_lcb_z')
+    alpha_lcb_count = int((alpha_lcb_z >= 1.25).sum())
     score_gap = float(branch_diag.get('score_gap', 0.0))
     score_gap_5_10 = float(branch_diag.get('score_gap_5_10', 0.0))
     if len(full_pool) >= 10 and 'rerank_score' in full_pool.columns:
@@ -1356,8 +1713,11 @@ def _union_gate_diag(candidates, branch_diag):
     out = dict(branch_diag)
     out.update({
         'alpha_exception_count': int(alpha_flags.sum()),
+        'alpha_lcb_count': alpha_lcb_count,
         'stable_fill_count': int(top.get('stable_candidate', pd.Series(False, index=top.index)).astype(bool).sum()),
         'max_alpha_score_z': max_alpha_z,
+        'max_alpha_lcb_z': max_alpha_lcb_z,
+        'mean_alpha_lcb': float(alpha_lcb.mean()),
         'score_gap': score_gap,
         'score_gap_5_10': score_gap_5_10,
         'selected_branch_count': int(len(branch_sources)),
@@ -1370,19 +1730,24 @@ def _union_gate_diag(candidates, branch_diag):
         'top5_disagreement': risk_disagreement,
         'branch_risk_score': float(branch_risk_score),
     })
+    if hasattr(candidates, 'attrs') and candidates.attrs.get('combo_info'):
+        out.update(candidates.attrs.get('combo_info', {}))
     return out
 
 
 def _alpha_quality_gate(union_diag, regime):
     alpha_exception_count = int(union_diag.get('alpha_exception_count', 0))
+    alpha_lcb_count = int(union_diag.get('alpha_lcb_count', alpha_exception_count))
+    clean_alpha_count = max(alpha_exception_count, alpha_lcb_count)
     stable_fill_count = int(union_diag.get('stable_fill_count', 0))
     max_alpha_z = float(union_diag.get('max_alpha_score_z', 0.0))
+    max_alpha_lcb_z = float(union_diag.get('max_alpha_lcb_z', max_alpha_z))
     score_gap = float(union_diag.get('score_gap', 0.0))
     score_gap_5_10 = float(union_diag.get('score_gap_5_10', 0.0))
     selected_branch_count = int(union_diag.get('selected_branch_count', 0))
     avg_consensus_count = float(union_diag.get('avg_consensus_count', 0.0))
 
-    alpha_strong = max_alpha_z >= 1.50 or score_gap >= 0.080 or score_gap_5_10 >= 0.040
+    alpha_strong = max(max_alpha_z, max_alpha_lcb_z) >= 1.50 or score_gap >= 0.080 or score_gap_5_10 >= 0.040
     consensus_ok = selected_branch_count >= 3 or avg_consensus_count >= 2.0
 
     if regime == 'risk_off':
@@ -1394,16 +1759,16 @@ def _alpha_quality_gate(union_diag, regime):
         )
     if regime == 'mixed_defensive':
         return (
-            alpha_exception_count >= 1
+            clean_alpha_count >= 1
             and stable_fill_count >= 1
             and alpha_strong
             and consensus_ok
         )
     if regime == 'risk_on_strict':
-        return alpha_exception_count >= 1 and alpha_strong
+        return clean_alpha_count >= 1 and alpha_strong
     if regime == 'neutral_positive':
         return (
-            alpha_exception_count >= 1
+            clean_alpha_count >= 1
             and stable_fill_count >= 1
             and alpha_strong
             and consensus_ok
@@ -1468,6 +1833,62 @@ def _fallback_branch_for_gate(selector_cfg, regime, reason):
     return gate_cfg.get('default_fallback_branch', 'legal_minrisk_hardened')
 
 
+def _route_fallback_branch(chosen_name, diagnostics, selector_cfg, regime, regime_stats):
+    router_cfg = selector_cfg.get('fallback_router', {})
+    if not router_cfg.get('enabled', False):
+        return chosen_name, {}
+
+    default_branch = router_cfg.get('default_branch', selector_cfg.get('fallback_branch', 'legal_minrisk_hardened'))
+    secondary_branch = router_cfg.get('secondary_branch', 'defensive_v2_strict')
+    if chosen_name not in {default_branch, secondary_branch}:
+        return chosen_name, {'fallback_router_reason': 'not_fallback_branch'}
+
+    by_branch = {row.get('branch'): row for row in diagnostics if row.get('available', False)}
+    default_diag = by_branch.get(default_branch)
+    secondary_diag = by_branch.get(secondary_branch)
+    if default_diag is None or secondary_diag is None:
+        return chosen_name, {'fallback_router_reason': 'missing_fallback_diag'}
+
+    market_toxic = (
+        regime == 'risk_off'
+        and (
+            float(regime_stats.get('median_ret1', 0.0)) <= -0.006
+            or (
+                float(regime_stats.get('breadth_5d', 1.0)) < 0.45
+                and float(regime_stats.get('median_ret5', 0.0)) < 0.0
+            )
+            or (
+                float(regime_stats.get('high_vol_ratio', 0.0)) >= 0.40
+                and float(regime_stats.get('median_ret1', 0.0)) < 0.0
+            )
+        )
+    )
+    if router_cfg.get('require_market_toxic', True) and not market_toxic:
+        return chosen_name, {'fallback_router_reason': 'market_not_toxic'}
+
+    default_risk = float(default_diag.get('branch_risk_score', 1.0))
+    secondary_risk = float(secondary_diag.get('branch_risk_score', 1.0))
+    min_improvement = float(router_cfg.get('min_risk_improvement', 0.08))
+    secondary_cleaner = (
+        secondary_risk + min_improvement < default_risk
+        and int(secondary_diag.get('top5_tail_risk_count', 5)) <= int(default_diag.get('top5_tail_risk_count', 5))
+        and int(secondary_diag.get('top5_very_tail_count', 5)) <= int(default_diag.get('top5_very_tail_count', 5))
+        and float(secondary_diag.get('top5_disagreement', 1.0)) <= float(default_diag.get('top5_disagreement', 1.0)) + 0.08
+    )
+    if chosen_name == default_branch and secondary_cleaner:
+        return secondary_branch, {
+            'fallback_router_reason': 'secondary_cleaner_in_toxic_market',
+            'fallback_router_default_risk': default_risk,
+            'fallback_router_secondary_risk': secondary_risk,
+        }
+
+    return chosen_name, {
+        'fallback_router_reason': 'keep_default',
+        'fallback_router_default_risk': default_risk,
+        'fallback_router_secondary_risk': secondary_risk,
+    }
+
+
 def _evaluate_gated_union(union_candidates, union_diag, regime, regime_stats, selector_cfg):
     gate_cfg = selector_cfg.get('gated_union_rerank', {})
     if not gate_cfg.get('enabled', False):
@@ -1510,10 +1931,15 @@ def _evaluate_gated_union(union_candidates, union_diag, regime, regime_stats, se
     gate_debug.update({
         'alpha_quality_ok': bool(alpha_ok),
         'alpha_exception_count': gate_diag.get('alpha_exception_count', 0),
+        'alpha_lcb_count': gate_diag.get('alpha_lcb_count', gate_diag.get('alpha_exception_count', 0)),
         'stable_fill_count': gate_diag.get('stable_fill_count', 0),
         'max_alpha_score_z': gate_diag.get('max_alpha_score_z', 0.0),
+        'max_alpha_lcb_z': gate_diag.get('max_alpha_lcb_z', gate_diag.get('max_alpha_score_z', 0.0)),
+        'mean_alpha_lcb': gate_diag.get('mean_alpha_lcb', 0.0),
         'selected_branch_count': gate_diag.get('selected_branch_count', 0),
         'avg_consensus_count': gate_diag.get('avg_consensus_count', 0.0),
+        'combo_search_score': gate_diag.get('combo_search_score', np.nan),
+        'combo_search_feasible': gate_diag.get('combo_search_feasible', 0),
     })
     if not alpha_ok:
         reason = 'alpha_quality_failed_risk_on' if regime == 'risk_on_strict' else 'alpha_quality_failed'
@@ -1559,6 +1985,9 @@ def _diag_passes(diag, regime, regime_stats, selector_cfg, branch_name):
         return True
 
     if branch_name == 'legal_plus_1alpha':
+        return True
+
+    if branch_name == 'safe_union_2slot':
         return True
 
     if branch_name in {'legal_minrisk', 'legal_minrisk_hardened'}:
@@ -1821,6 +2250,7 @@ def choose_selector_branch(score_df, selector_cfg):
     chosen_cfg = {}
     branch_payloads = {}
     gate_debug_rows = []
+    fallback_router_info = {}
 
     for branch_name in branch_order:
         candidates, branch_cfg = _branch_candidates(score_df, selector_cfg, branch_name, regime=regime)
@@ -1831,6 +2261,8 @@ def choose_selector_branch(score_df, selector_cfg):
         diag['regime'] = regime
         if hasattr(candidates, 'attrs') and candidates.attrs.get('legal_plus_info'):
             diag.update(candidates.attrs.get('legal_plus_info', {}))
+        if hasattr(candidates, 'attrs') and candidates.attrs.get('safe_union_info'):
+            diag.update(candidates.attrs.get('safe_union_info', {}))
         diag['rule_passes'] = _diag_passes(diag, regime, regime_stats, selector_cfg, branch_name)
         diag['passes'] = diag['rule_passes']
 
@@ -1884,6 +2316,24 @@ def choose_selector_branch(score_df, selector_cfg):
             chosen_name = best['branch']
             chosen_candidates, chosen_cfg = branch_payloads.get(chosen_name, (None, {}))
 
+    if not forced and chosen_name is not None:
+        routed_name, fallback_router_info = _route_fallback_branch(
+            chosen_name,
+            diagnostics,
+            selector_cfg,
+            regime,
+            regime_stats,
+        )
+        if routed_name != chosen_name:
+            routed_candidates, routed_cfg = branch_payloads.get(routed_name, (None, {}))
+            if routed_candidates is None or len(routed_candidates) < 5:
+                routed_candidates, routed_cfg = _branch_candidates(score_df, selector_cfg, routed_name, regime=regime)
+                branch_payloads[routed_name] = (routed_candidates, routed_cfg)
+            if routed_candidates is not None and len(routed_candidates) >= 5:
+                chosen_name = routed_name
+                chosen_candidates = routed_candidates
+                chosen_cfg = routed_cfg
+
     if chosen_candidates is None or len(chosen_candidates) < 5:
         chosen_candidates, chosen_cfg = _branch_candidates(score_df, selector_cfg, fallback_branch, regime=regime)
         chosen_name = fallback_branch
@@ -1907,6 +2357,7 @@ def choose_selector_branch(score_df, selector_cfg):
         'meta_gate_enabled': gate_artifact is not None,
         'meta_gate_artifact': gate_artifact.get('artifact_path') if gate_artifact else None,
         'gate_debug': gate_debug_rows,
+        'fallback_router': fallback_router_info,
     }
     candidate_debug = chosen_candidates.attrs.get('candidate_debug') if hasattr(chosen_candidates, 'attrs') else None
     if candidate_debug is not None:
@@ -1930,7 +2381,10 @@ def _get_autocast_context(device):
 
 
 def main():
-    data_file = os.environ.get('BDC_DATA_FILE', os.path.join(config['data_path'], 'train.csv'))
+    data_file = os.environ.get(
+        'BDC_DATA_FILE',
+        os.path.join(config['data_path'], 'train_hs300_20260424.csv'),
+    )
     model_dir = _resolve_model_dir()
     model_path = os.path.join(model_dir, 'best_model.pth')
     scaler_path = os.path.join(model_dir, 'scaler.pkl')

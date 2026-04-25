@@ -12,6 +12,7 @@ a diagnostic replay with the current model, not a leakage-free OOF backtest.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import itertools
 import json
@@ -785,6 +786,8 @@ def run_predict_for_anchor(
     filtered_path = anchor_dir / "predict_filtered_top30.csv"
     selector_json_path = anchor_dir / "selector_diagnostics.json"
     selector_csv_path = anchor_dir / "selector_diagnostics.csv"
+    selector_debug_path = anchor_dir / "selector_candidates_debug.csv"
+    gated_debug_path = anchor_dir / "gated_selector_debug.csv"
     stdout_path = anchor_dir / "predict_stdout.txt"
     stderr_path = anchor_dir / "predict_stderr.txt"
 
@@ -797,6 +800,8 @@ def run_predict_for_anchor(
     env["BDC_FILTERED_DF_PATH"] = str(filtered_path)
     env["BDC_SELECTOR_JSON_PATH"] = str(selector_json_path)
     env["BDC_SELECTOR_CSV_PATH"] = str(selector_csv_path)
+    env["BDC_SELECTOR_DEBUG_PATH"] = str(selector_debug_path)
+    env["BDC_GATED_SELECTOR_DEBUG_PATH"] = str(gated_debug_path)
     if model_dir:
         env["BDC_MODEL_DIR"] = model_dir
     if not use_cache:
@@ -823,6 +828,85 @@ def run_predict_for_anchor(
         "score_df_path": score_df_path,
         "selector_info": selector_info,
     }
+
+
+def analyze_anchor_window(
+    raw: pd.DataFrame,
+    anchor: pd.Timestamp,
+    run_dir: Path,
+    model_dir: str | None,
+    use_cache: bool,
+    label_horizon: int,
+) -> dict:
+    print(f"[batch] running anchor={anchor:%Y-%m-%d}")
+    artifacts = run_predict_for_anchor(
+        raw=raw,
+        anchor=anchor,
+        run_dir=run_dir,
+        model_dir=model_dir,
+        use_cache=use_cache,
+    )
+    realized, score_window = realized_returns_for_anchor(raw, anchor, label_horizon=label_horizon)
+    selected_score, selected_detail = score_result(artifacts["output_path"], realized)
+    branch_table = branch_table_for_window(artifacts["score_df_path"], realized)
+
+    selector_info = artifacts["selector_info"]
+    regime = selector_info.get("regime", "")
+    regime_stats = selector_info.get("regime_stats", {}) or {}
+    shadow_scores = branch_table.set_index("branch")["score"].to_dict() if len(branch_table) else {}
+    summary_row = {
+        "selector_version": selector_info.get("selector_version", SELECTOR_VERSION),
+        "config_hash": CONFIG_HASH,
+        "gate_hash": GATE_HASH,
+        "anchor_date": anchor.strftime("%Y-%m-%d"),
+        "score_window": score_window,
+        "selected_score": selected_score,
+        "score_full_union_shadow": shadow_scores.get("union_topn_rrf_lcb"),
+        "score_legal_shadow": shadow_scores.get("legal_minrisk_hardened"),
+        "score_defensive_shadow": shadow_scores.get("defensive_v2_strict"),
+        "score_legal_plus_1alpha_shadow": shadow_scores.get("legal_plus_1alpha_shadow"),
+        "score_safe_union_2slot_shadow": shadow_scores.get("safe_union_2slot_shadow"),
+        "chosen_branch": selector_info.get("chosen_branch", ""),
+        "regime": regime,
+        "breadth_1d": regime_stats.get("breadth_1d"),
+        "breadth_5d": regime_stats.get("breadth_5d"),
+        "median_ret1": regime_stats.get("median_ret1"),
+        "median_ret5": regime_stats.get("median_ret5"),
+        "high_vol_ratio": regime_stats.get("high_vol_ratio"),
+        "selected_picks": ",".join(selected_detail["stock_id"].tolist()),
+        "selected_rets": ",".join(f"{x:.2%}" for x in selected_detail["realized_ret"].tolist()),
+        "bad_count": int((selected_detail["realized_ret"] < -0.03).sum()),
+        "very_bad_count": int((selected_detail["realized_ret"] < -0.05).sum()),
+        "without_best": selected_score - float(selected_detail["contribution"].max()),
+    }
+
+    selected_detail = selected_detail.copy()
+    selected_detail.insert(0, "portfolio", "selected")
+    selected_detail.insert(0, "anchor_date", anchor.strftime("%Y-%m-%d"))
+    selected_detail.insert(1, "score_window", score_window)
+
+    branch_table = branch_table.copy()
+    branch_table.insert(0, "anchor_date", anchor.strftime("%Y-%m-%d"))
+    branch_table.insert(1, "score_window", score_window)
+    branch_table.insert(2, "regime", regime)
+    for key in ["breadth_1d", "breadth_5d", "median_ret1", "median_ret5", "high_vol_ratio"]:
+        branch_table[key] = regime_stats.get(key)
+
+    print(f"[batch] finished anchor={anchor:%Y-%m-%d}, selected_score={selected_score:.6f}")
+    return {
+        "anchor": anchor,
+        "summary_row": summary_row,
+        "branch_table": branch_table,
+        "selected_detail": selected_detail,
+    }
+
+
+def resolve_worker_count(requested: int | None, anchor_count: int) -> int:
+    if requested is not None:
+        if requested < 1:
+            raise ValueError("--workers must be >= 1")
+        return min(requested, anchor_count)
+    return max(1, min(4, anchor_count, os.cpu_count() or 1))
 
 
 def summarize_windows(summary: pd.DataFrame) -> dict:
@@ -854,6 +938,12 @@ def main() -> None:
     parser.add_argument("--label-horizon", type=int, default=5)
     parser.add_argument("--model-dir", default=None)
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of anchors to run in parallel; default=min(4, anchors, cpu_count)",
+    )
     args = parser.parse_args()
 
     raw_path = ROOT / args.raw
@@ -867,68 +957,59 @@ def main() -> None:
     run_dir = ROOT / args.out_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    summary_rows = []
-    branch_rows = []
-    detail_rows = []
+    workers = resolve_worker_count(args.workers, len(anchors))
 
     print(f"[batch] raw={raw_path}")
     print(f"[batch] out={run_dir}")
     print(f"[batch] anchors={[d.strftime('%Y-%m-%d') for d in anchors]}")
+    print(f"[batch] workers={workers}")
 
-    for anchor in anchors:
-        print(f"[batch] running anchor={anchor:%Y-%m-%d}")
-        artifacts = run_predict_for_anchor(
-            raw=raw,
-            anchor=anchor,
-            run_dir=run_dir,
-            model_dir=args.model_dir,
-            use_cache=not args.no_cache,
-        )
-        realized, score_window = realized_returns_for_anchor(raw, anchor, label_horizon=args.label_horizon)
-        selected_score, selected_detail = score_result(artifacts["output_path"], realized)
-        branch_table = branch_table_for_window(artifacts["score_df_path"], realized)
+    # 限制每个 predict 子进程的 feature_workers，避免 Windows 资源耗尽
+    # Windows multiprocessing IPC 传输大量 DataFrame 时，过多并发进程会触发 OSError 1450
+    safe_fw = max(1, min(4, (os.cpu_count() or 1) // workers))
+    os.environ["BDC_FEATURE_WORKERS"] = str(safe_fw)
+    print(f"[batch] feature_workers_per_predict={safe_fw}")
 
-        selector_info = artifacts["selector_info"]
-        regime = selector_info.get("regime", "")
-        regime_stats = selector_info.get("regime_stats", {}) or {}
-        shadow_scores = branch_table.set_index("branch")["score"].to_dict() if len(branch_table) else {}
-        summary_rows.append({
-            "selector_version": selector_info.get("selector_version", SELECTOR_VERSION),
-            "config_hash": CONFIG_HASH,
-            "gate_hash": GATE_HASH,
-            "anchor_date": anchor.strftime("%Y-%m-%d"),
-            "score_window": score_window,
-            "selected_score": selected_score,
-            "score_full_union_shadow": shadow_scores.get("union_topn_rrf_lcb"),
-            "score_legal_shadow": shadow_scores.get("legal_minrisk_hardened"),
-            "score_defensive_shadow": shadow_scores.get("defensive_v2_strict"),
-            "score_legal_plus_1alpha_shadow": shadow_scores.get("legal_plus_1alpha_shadow"),
-            "score_safe_union_2slot_shadow": shadow_scores.get("safe_union_2slot_shadow"),
-            "chosen_branch": selector_info.get("chosen_branch", ""),
-            "regime": regime,
-            "breadth_1d": regime_stats.get("breadth_1d"),
-            "breadth_5d": regime_stats.get("breadth_5d"),
-            "median_ret1": regime_stats.get("median_ret1"),
-            "median_ret5": regime_stats.get("median_ret5"),
-            "high_vol_ratio": regime_stats.get("high_vol_ratio"),
-            "selected_picks": ",".join(selected_detail["stock_id"].tolist()),
-            "selected_rets": ",".join(f"{x:.2%}" for x in selected_detail["realized_ret"].tolist()),
-            "bad_count": int((selected_detail["realized_ret"] < -0.03).sum()),
-            "very_bad_count": int((selected_detail["realized_ret"] < -0.05).sum()),
-            "without_best": selected_score - float(selected_detail["contribution"].max()),
-        })
+    if workers == 1:
+        results = [
+            analyze_anchor_window(
+                raw=raw,
+                anchor=anchor,
+                run_dir=run_dir,
+                model_dir=args.model_dir,
+                use_cache=not args.no_cache,
+                label_horizon=args.label_horizon,
+            )
+            for anchor in anchors
+        ]
+    else:
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_anchor = {
+                executor.submit(
+                    analyze_anchor_window,
+                    raw,
+                    anchor,
+                    run_dir,
+                    args.model_dir,
+                    not args.no_cache,
+                    args.label_horizon,
+                ): anchor
+                for anchor in anchors
+            }
+            for future in as_completed(future_to_anchor):
+                anchor = future_to_anchor[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    raise RuntimeError(f"anchor {anchor:%Y-%m-%d} failed") from exc
 
-        selected_detail.insert(0, "portfolio", "selected")
-        selected_detail.insert(0, "anchor_date", anchor.strftime("%Y-%m-%d"))
-        selected_detail.insert(1, "score_window", score_window)
-        detail_rows.append(selected_detail)
+        anchor_order = {anchor: idx for idx, anchor in enumerate(anchors)}
+        results.sort(key=lambda item: anchor_order[item["anchor"]])
 
-        branch_table.insert(0, "anchor_date", anchor.strftime("%Y-%m-%d"))
-        branch_table.insert(1, "score_window", score_window)
-        branch_table.insert(2, "regime", regime)
-        for key in ["breadth_1d", "breadth_5d", "median_ret1", "median_ret5", "high_vol_ratio"]:
-            branch_table[key] = regime_stats.get(key)
-        branch_rows.append(branch_table)
+    summary_rows = [item["summary_row"] for item in results]
+    branch_rows = [item["branch_table"] for item in results]
+    detail_rows = [item["selected_detail"] for item in results]
 
     summary = pd.DataFrame(summary_rows)
     branches = pd.concat(branch_rows, ignore_index=True) if branch_rows else pd.DataFrame()

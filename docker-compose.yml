@@ -11,6 +11,8 @@ services:
     command: bash -lc "uv run python app/code/src/test.py"
     runtime: nvidia
     environment:
+      - BDC_DATA_FILE=/app/data/train_hs300_20260424.csv
+      - BDC_OUTPUT_PATH=/app/output/result.csv
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
     deploy:

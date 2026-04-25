@@ -29,8 +29,8 @@ WORKDIR /app
 # Copy dependency files
 COPY pyproject.toml uv.lock readme.md ./
 
-# Install dependencies
-RUN uv sync --frozen
+# Install dependencies without retaining downloaded wheels in the final layer
+RUN uv sync --frozen --no-cache
 
 # Copy the application code
 COPY . .

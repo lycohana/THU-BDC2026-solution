@@ -145,7 +145,7 @@ uv run python app/code/src/test.py
 
 主要步骤：
 
-1. 读取 `data/train.csv`，取最新交易日作为预测日。
+1. 读取 `data/train_hs300_20260424.csv`，取最新交易日 2026-04-24 作为预测日。
 2. 构造与训练一致的特征，并按 `scaler.feature_names_in_` 对齐。
 3. 构造每只股票最近 60 个交易日的输入序列。
 4. 加载 Transformer 和 LightGBM 产物。
