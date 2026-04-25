@@ -8,6 +8,13 @@ asset
 model
 output
 temp
+app/output
+app/temp
+app/data/backups
+data/backups
+model_backups
+*_docker.log
+*.log
 test/output
 test/results_output
 test/tars

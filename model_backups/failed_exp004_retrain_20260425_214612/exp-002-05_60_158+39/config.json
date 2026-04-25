@@ -1,0 +1,189 @@
+{
+    "experiment_name": "exp-002-05",
+    "sequence_length": 60,
+    "d_model": 256,
+    "nhead": 4,
+    "num_layers": 3,
+    "dim_feedforward": 512,
+    "batch_size": 4,
+    "num_epochs": 50,
+    "learning_rate": 1e-05,
+    "dropout": 0.1,
+    "feature_num": "158+39",
+    "max_grad_norm": 5.0,
+    "pairwise_weight": 1,
+    "base_weight": 1.0,
+    "top5_weight": 2.0,
+    "output_dir": "./model/exp-002-05_60_158+39",
+    "data_path": "./data",
+    "train_ranking_data_path": "./temp/exp-002-05_train_ranking_60_158+39_cs.pkl",
+    "val_ranking_data_path": "./temp/exp-002-05_val_ranking_60_158+39_cs.pkl",
+    "train_lgb": true,
+    "blend": {
+        "score_mode": "selector",
+        "normalize": "rank_pct",
+        "transformer_weight": 0.3,
+        "lgb_weight": 0.7,
+        "agreement_penalty": 0.0
+    },
+    "selector": {
+        "enabled": true,
+        "force_branch": null,
+        "fallback_branch": "baseline_defensive",
+        "baseline_fallback_ids": [
+            "600919",
+            "601169",
+            "601398",
+            "601988",
+            "601658"
+        ],
+        "branches": {
+            "lgb_only": {
+                "score_col": "score_lgb_only",
+                "filter": "nofilter",
+                "exposure": 1.0
+            },
+            "balanced_blend": {
+                "score_col": "score_balanced",
+                "filter": "nofilter",
+                "exposure": 1.0
+            },
+            "conservative_blend": {
+                "score_col": "score_conservative",
+                "filter": "nofilter",
+                "exposure": 1.0
+            },
+            "conservative_softrisk": {
+                "score_col": "score_conservative_softrisk",
+                "filter": "liquidity_q05",
+                "exposure": 1.0
+            },
+            "defensive_branch": {
+                "score_col": "score_defensive",
+                "filter": "defensive",
+                "exposure": 1.0
+            },
+            "defensive_v2": {
+                "score_col": "score_defensive_v2",
+                "filter": "liquidity_q10",
+                "exposure": 1.0
+            }
+        },
+        "regime_branch_order": {
+            "risk_on": [
+                "lgb_only",
+                "balanced_blend",
+                "conservative_blend",
+                "baseline_defensive"
+            ],
+            "neutral": [
+                "balanced_blend",
+                "conservative_blend",
+                "lgb_only",
+                "baseline_defensive"
+            ],
+            "mixed_defensive": [
+                "conservative_blend",
+                "conservative_softrisk",
+                "baseline_defensive",
+                "defensive_v2"
+            ],
+            "risk_off": [
+                "conservative_blend",
+                "conservative_softrisk",
+                "baseline_defensive",
+                "defensive_v2"
+            ]
+        },
+        "confidence": {
+            "min_score_gap": 0.015,
+            "max_disagreement": {
+                "risk_on": 0.55,
+                "neutral": 0.5,
+                "mixed_defensive": 0.48,
+                "risk_off": 0.45
+            },
+            "min_top20_overlap": {
+                "risk_on": 0.1,
+                "neutral": 0.1,
+                "mixed_defensive": 0.0,
+                "risk_off": 0.0
+            },
+            "max_top5_sigma_quantile": 1.0,
+            "max_top5_amp_quantile": 1.0
+        }
+    },
+    "postprocess": {
+        "filter": "nofilter",
+        "weighting": "equal",
+        "liquidity_quantile": 0.1,
+        "sigma_quantile": 0.85,
+        "exposure_cap": 1.0
+    },
+    "lgb": {
+        "rank_weight": 0.65,
+        "reg_weight": 0.35,
+        "top5_rank_weight": 0.0,
+        "label_clip": 0.2,
+        "rank_learning_rate": 0.03,
+        "reg_learning_rate": 0.03,
+        "rank_n_estimators": 1500,
+        "reg_n_estimators": 1200,
+        "num_leaves": 63,
+        "min_child_samples": 64,
+        "subsample": 0.8,
+        "colsample_bytree": 0.7,
+        "reg_lambda": 2.0,
+        "early_stopping_rounds": 100,
+        "log_period": 100,
+        "n_jobs": 8
+    },
+    "lgb_top5": {
+        "train": false,
+        "blend_weight": 0.0,
+        "top1_gain": null,
+        "top5_gain": 10,
+        "top10_gain": 4,
+        "top20_gain": 1,
+        "negative_cap": 1,
+        "learning_rate": 0.03,
+        "n_estimators": 1500,
+        "num_leaves": 31,
+        "min_child_samples": 64,
+        "subsample": 0.8,
+        "colsample_bytree": 0.7,
+        "reg_lambda": 5.0,
+        "early_stopping_rounds": 100,
+        "log_period": 100
+    },
+    "lgb_search": {
+        "num_leaves": [
+            31,
+            63,
+            127
+        ],
+        "min_child_samples": [
+            32,
+            64,
+            128
+        ],
+        "learning_rate": [
+            0.02,
+            0.03,
+            0.05
+        ]
+    },
+    "feature_enhance": {
+        "add_industry_neutral": false,
+        "add_more_momentum": true,
+        "add_amount_change": true
+    },
+    "predict": {
+        "feature_workers": 6,
+        "use_cache": true,
+        "cache_dir": "./temp",
+        "cache_compress": 3,
+        "amp": true
+    },
+    "seed": 42
+}

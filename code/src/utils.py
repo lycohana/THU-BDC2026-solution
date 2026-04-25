@@ -92,7 +92,7 @@ def add_cross_section_features(df, date_col='日期'):
 
 
 def extend_feature_columns_with_cross_section(feature_columns, df):
-    """Keep the baseline feature list and append generated cross-section columns."""
+    """Keep the original feature list and append generated cross-section columns."""
     generated_prefixes = ('cs_rank_', 'cs_rz_', 'mkt_', 'alpha_rel_')
     extra_cols = [c for c in df.columns if c.startswith(generated_prefixes)]
     return list(dict.fromkeys(list(feature_columns) + extra_cols))

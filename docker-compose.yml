@@ -1,9 +1,10 @@
 services:
   app:
-    image: bdc2025:latest
+    image: bdc2026:latest
     pull_policy: never
     volumes:
       - ./app/data:/app/data
+      - ./app/model:/app/model
       - ./app/output:/app/output
       - ./app/temp:/app/temp
     working_dir: /app

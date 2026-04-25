@@ -205,16 +205,16 @@ bash test.sh
 
 ## Docker 与提交准备
 
-主办方要求镜像名为 `bdc2025`：
+镜像名使用 `bdc2026`：
 
 ```bash
-docker build -t bdc2025:latest .
+docker build -t bdc2026:latest .
 # 或者：
-docker buildx build --platform linux/amd64 -t bdc2025:latest --load .
-docker save -o team_name.tar bdc2025:latest
+docker buildx build --platform linux/amd64 -t bdc2026:latest --load .
+docker save -o team_name.tar bdc2026:latest
 ```
 
-本地 Docker Compose 已使用镜像名 `bdc2025:latest`，并按官方结构挂载 `app/data`、`app/output`、`app/temp`：
+本地 Docker Compose 已使用镜像名 `bdc2026:latest`，并按官方结构挂载 `app/data`、`app/output`、`app/temp`：
 
 ```bash
 docker compose up --no-build app

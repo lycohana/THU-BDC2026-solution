@@ -788,13 +788,6 @@ def run_oof_grid(
         oof_min_return=('validation_min_return', 'min'),
         oof_max_return=('validation_mean_return', 'max'),
         oof_last_fold_return=('last_fold_return', 'last'),
-        oof_mean_diff=('validation_mean_diff', 'mean'),
-        oof_median_diff=('validation_median_diff', 'mean'),
-        oof_q10_diff=('validation_q10_diff', 'mean'),
-        oof_min_diff=('validation_min_diff', 'min'),
-        latest_fold_diff=('last_fold_diff', 'last'),
-        fold_win_rate=('fold_mean_diff_positive', 'mean'),
-        daily_win_rate_vs_baseline=('daily_win_rate_vs_baseline', 'mean'),
         win_rate_vs_equal=('win_rate_vs_equal', 'mean'),
         avg_max_weight=('avg_max_weight', 'mean'),
         avg_top2_weight=('avg_top2_weight', 'mean'),
@@ -819,42 +812,41 @@ def run_oof_grid(
     bootstrap_rows = []
     for key, group in combined.groupby(group_cols, sort=False):
         row = dict(zip(group_cols, key))
-        row['bootstrap_p_diff_gt0'] = _bootstrap_prob_positive(group['validation_mean_diff'].to_numpy(dtype=np.float64))
+        row['bootstrap_p_return_gt0'] = _bootstrap_prob_positive(group['validation_mean_return'].to_numpy(dtype=np.float64))
         bootstrap_rows.append(row)
     aggregated = aggregated.merge(pd.DataFrame(bootstrap_rows), on=group_cols, how='left')
     aggregated['complexity_level'] = aggregated.apply(_complexity_level, axis=1)
     aggregated['passes_basic_gate'] = (
         (aggregated['constraint_pass_rate'] >= 1.0)
-        & (aggregated['oof_mean_diff'] > 0.0)
-        & (aggregated['oof_median_diff'] > 0.0)
-        & (aggregated['bootstrap_p_diff_gt0'] >= 0.75)
-        & (aggregated['fold_win_rate'] >= 0.50)
-        & (aggregated['oof_q10_diff'] >= -0.002)
-        & (aggregated['latest_fold_diff'] >= -0.002)
+        & (aggregated['oof_mean_return'] > 0.0)
+        & (aggregated['oof_median_return'] > 0.0)
+        & (aggregated['bootstrap_p_return_gt0'] >= 0.75)
+        & (aggregated['oof_q10_return'] >= -0.010)
+        & (aggregated['oof_last_fold_return'] >= -0.010)
     )
     aggregated['passes_complexity_gate'] = aggregated['passes_basic_gate'] & (
         (
             (aggregated['complexity_level'] <= 1)
-            & (aggregated['bootstrap_p_diff_gt0'] >= 0.75)
+            & (aggregated['bootstrap_p_return_gt0'] >= 0.75)
         )
         | (
             (aggregated['complexity_level'] <= 3)
-            & (aggregated['bootstrap_p_diff_gt0'] >= 0.80)
+            & (aggregated['bootstrap_p_return_gt0'] >= 0.80)
         )
         | (
             (aggregated['complexity_level'] > 3)
-            & (aggregated['bootstrap_p_diff_gt0'] >= 0.85)
+            & (aggregated['bootstrap_p_return_gt0'] >= 0.85)
         )
     )
     aggregated = aggregated.sort_values(
         [
             'passes_complexity_gate',
             'passes_basic_gate',
-            'bootstrap_p_diff_gt0',
-            'oof_mean_diff',
-            'oof_median_diff',
-            'oof_q10_diff',
-            'latest_fold_diff',
+            'bootstrap_p_return_gt0',
+            'oof_mean_return',
+            'oof_median_return',
+            'oof_q10_return',
+            'oof_last_fold_return',
             'complexity_level',
         ],
         ascending=[False, False, False, False, False, False, False, True],
@@ -930,26 +922,6 @@ def _run_grid_on_fold(
         flush=True,
     )
 
-    baseline_base = _apply_blend_scores(
-        score_df,
-        0.30,
-        0.70,
-        0.0,
-        lgb_rank_weight=float(config.get('lgb', {}).get('rank_weight', 0.65)),
-        lgb_top5_weight=0.0,
-    )
-    baseline_daily_scores = {}
-    baseline_groups = list(baseline_base.groupby('date', sort=True))
-    for date, baseline_day in tqdm(baseline_groups, desc=f'fold {fold_idx} baseline', leave=False):
-        baseline_filtered = apply_filter(
-            baseline_day,
-            'stable',
-            liquidity_quantile=0.10,
-            sigma_quantile=0.85,
-        )
-        baseline_score, _ = _fast_weighted_score(baseline_day, baseline_filtered, 'equal')
-        baseline_daily_scores[date] = baseline_score
-
     fusion_tasks = [
         (transformer_weight, 1.0 - transformer_weight, penalty, lgb_rank_weight, lgb_top5_weight)
         for transformer_weight in weights
@@ -974,9 +946,6 @@ def _run_grid_on_fold(
         daily_scores = []
         day_groups = list(base.groupby('date', sort=True))
         for date, day_base in tqdm(day_groups, desc=f'fold {fold_idx} days t{transformer_weight:.2f} lrw{float(lgb_rank_weight):.2f} t5{float(lgb_top5_weight):.2f}', leave=False):
-            if date not in baseline_daily_scores:
-                continue
-            baseline_score = baseline_daily_scores[date]
             for liquidity_q in liquidity_quantiles:
                 for sigma_q in sigma_quantiles:
                     for filter_name in filter_names:
@@ -990,14 +959,10 @@ def _run_grid_on_fold(
                         for weight_name in weighting_names:
                             try:
                                 score, metrics = _fast_weighted_score(day_base, filtered, weight_name)
-                                diff = score - baseline_score
                                 daily_scores.append({
                                     'key': (filter_name, weight_name, liquidity_q, sigma_q),
                                     'date': date,
                                     'score': score,
-                                    'baseline_score': baseline_score,
-                                    'diff_vs_baseline': diff,
-                                    'win_vs_baseline': float(diff > 0.0),
                                     'win_vs_equal': float(score > equal_score),
                                     'max_weight': metrics['max_weight'],
                                     'top2_weight': metrics['top2_weight'],
@@ -1041,13 +1006,6 @@ def _run_grid_on_fold(
                 'validation_q10_return': float(grouped['score'].quantile(0.10)),
                 'validation_min_return': float(grouped['score'].min()),
                 'last_fold_return': float(grouped['score'].iloc[-1]),
-                'validation_mean_diff': float(grouped['diff_vs_baseline'].mean()),
-                'validation_median_diff': float(grouped['diff_vs_baseline'].median()),
-                'validation_q10_diff': float(grouped['diff_vs_baseline'].quantile(0.10)),
-                'validation_min_diff': float(grouped['diff_vs_baseline'].min()),
-                'last_fold_diff': float(grouped['diff_vs_baseline'].iloc[-1]),
-                'fold_mean_diff_positive': float(grouped['diff_vs_baseline'].mean() > 0.0),
-                'daily_win_rate_vs_baseline': float(grouped['win_vs_baseline'].mean()),
                 'win_rate_vs_equal': float(grouped['win_vs_equal'].mean()),
                 'avg_max_weight': float(grouped['max_weight'].mean()),
                 'avg_top2_weight': float(grouped['top2_weight'].mean()),

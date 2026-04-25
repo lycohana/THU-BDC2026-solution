@@ -174,6 +174,14 @@ def current_filter(score_df, liquidity_quantile=0.20):
     return filtered if len(filtered) >= 5 else out
 
 
+def liquidity_floor_filter(score_df, liquidity_quantile=0.05):
+    out = score_df.copy()
+    if 'median_amount20' not in out.columns:
+        return out
+    filtered = out[out['median_amount20'] >= out['median_amount20'].quantile(liquidity_quantile)].copy()
+    return filtered if len(filtered) >= 5 else out
+
+
 def stable_filter(score_df, liquidity_quantile=0.20, sigma_quantile=0.85):
     out = current_filter(score_df, liquidity_quantile=liquidity_quantile)
     if 'sigma20' not in out.columns:
@@ -197,6 +205,44 @@ def no_extreme_momentum_filter(score_df, liquidity_quantile=0.20, sigma_quantile
         & (out['amp20'] <= amp_cap)
     ].copy()
     return filtered if len(filtered) >= 5 else out
+
+
+def liq_sigma_filter(score_df, liquidity_quantile=0.30, sigma_quantile=0.70):
+    out = stable_filter(
+        score_df,
+        liquidity_quantile=liquidity_quantile,
+        sigma_quantile=sigma_quantile,
+    )
+    return out if len(out) >= 5 else score_df
+
+
+def defensive_filter(
+    score_df,
+    liquidity_quantile=0.30,
+    sigma_quantile=0.70,
+    amp_quantile=0.70,
+):
+    out = score_df.copy()
+    cond = pd.Series(True, index=out.index)
+
+    if 'median_amount20' in out.columns:
+        cond &= out['median_amount20'] >= out['median_amount20'].quantile(liquidity_quantile)
+    if 'sigma20' in out.columns:
+        cond &= out['sigma20'] <= out['sigma20'].quantile(sigma_quantile)
+    if 'amp20' in out.columns:
+        cond &= out['amp20'] <= out['amp20'].quantile(amp_quantile)
+
+    ret1_col = 'ret1' if 'ret1' in out.columns else 'return_1' if 'return_1' in out.columns else None
+    if ret1_col is not None:
+        cond &= out[ret1_col] > -0.035
+
+    ret5_col = 'ret5' if 'ret5' in out.columns else 'return_5' if 'return_5' in out.columns else None
+    if ret5_col is not None:
+        cond &= out[ret5_col] > -0.08
+        cond &= out[ret5_col] < out[ret5_col].quantile(0.90)
+
+    filtered = out[cond].copy()
+    return filtered if len(filtered) >= 30 else out
 
 
 def consensus_filter(score_df, cutoffs=(30, 50, 80, 120)):
@@ -288,6 +334,73 @@ def stable_topk_rerank_filter(
     return out.sort_values('score', ascending=False).reset_index(drop=True)
 
 
+def legal_minrisk_filter(score_df):
+    out = score_df.copy()
+    required = {
+        'tail_risk_flag',
+        'reversal_flag',
+        'liq_rank',
+        'sigma_rank',
+        'downside_beta60_rank',
+        'max_drawdown20_rank',
+    }
+    if not required.issubset(out.columns):
+        return stable_filter(out, liquidity_quantile=0.10, sigma_quantile=0.75).sort_values('score', ascending=False).reset_index(drop=True)
+
+    cond = (
+        ~out['tail_risk_flag'].astype(bool)
+        & ~out['reversal_flag'].astype(bool)
+        & (out['liq_rank'].astype(float) >= 0.10)
+        & (out['sigma_rank'].astype(float) <= 0.75)
+        & (out['downside_beta60_rank'].astype(float) <= 0.75)
+        & (out['max_drawdown20_rank'].astype(float) <= 0.75)
+    )
+    filtered = out[cond].copy()
+    if len(filtered) >= 5:
+        return filtered.sort_values('score', ascending=False).reset_index(drop=True)
+
+    relaxed = out[
+        (out['liq_rank'].astype(float) >= 0.10)
+        & (out['sigma_rank'].astype(float) <= 0.85)
+        & ~out['reversal_flag'].astype(bool)
+    ].copy()
+    if len(relaxed) >= 5:
+        return relaxed.sort_values('score', ascending=False).reset_index(drop=True)
+
+    return stable_filter(out, liquidity_quantile=0.10, sigma_quantile=0.85).sort_values('score', ascending=False).reset_index(drop=True)
+
+
+def legal_minrisk_hardened_filter(score_df):
+    out = score_df.copy()
+    required = {
+        'tail_risk_flag',
+        'reversal_flag',
+        'liq_rank',
+        'sigma_rank',
+        'downside_beta60_rank',
+        'max_drawdown20_rank',
+        'amp_rank',
+        'ret1_rank',
+    }
+    if not required.issubset(out.columns):
+        return legal_minrisk_filter(out)
+
+    cond = (
+        ~out['tail_risk_flag'].astype(bool)
+        & ~out['reversal_flag'].astype(bool)
+        & (out['liq_rank'].astype(float) >= 0.15)
+        & (out['sigma_rank'].astype(float) <= 0.75)
+        & (out['downside_beta60_rank'].astype(float) <= 0.75)
+        & (out['max_drawdown20_rank'].astype(float) <= 0.75)
+        & (out['amp_rank'].astype(float) <= 0.85)
+        & (out['ret1_rank'].astype(float) >= 0.20)
+    )
+    filtered = out[cond].copy()
+    if len(filtered) >= 5:
+        return filtered.sort_values('score', ascending=False).reset_index(drop=True)
+    return legal_minrisk_filter(out)
+
+
 def _is_extreme_risk_off(score_df):
     required = {'ret20', 'sigma20'}
     if not required.issubset(score_df.columns) or len(score_df) == 0:
@@ -311,10 +424,18 @@ def _is_extreme_risk_off(score_df):
 def apply_filter(score_df, filter_name, liquidity_quantile=0.20, sigma_quantile=0.85):
     if filter_name == 'nofilter':
         return score_df.sort_values('score', ascending=False).reset_index(drop=True)
+    if filter_name == 'liquidity_q05':
+        return liquidity_floor_filter(score_df, liquidity_quantile=0.05).sort_values('score', ascending=False).reset_index(drop=True)
+    if filter_name == 'liquidity_q10':
+        return liquidity_floor_filter(score_df, liquidity_quantile=0.10).sort_values('score', ascending=False).reset_index(drop=True)
     if filter_name == 'liquidity80':
         return current_filter(score_df, liquidity_quantile=liquidity_quantile).sort_values('score', ascending=False).reset_index(drop=True)
     if filter_name == 'stable':
         return stable_filter(score_df, liquidity_quantile=liquidity_quantile, sigma_quantile=sigma_quantile).sort_values('score', ascending=False).reset_index(drop=True)
+    if filter_name == 'liq30_sigma70':
+        return liq_sigma_filter(score_df, liquidity_quantile=0.30, sigma_quantile=0.70).sort_values('score', ascending=False).reset_index(drop=True)
+    if filter_name == 'defensive':
+        return defensive_filter(score_df, liquidity_quantile=0.30, sigma_quantile=0.70, amp_quantile=0.70).sort_values('score', ascending=False).reset_index(drop=True)
     if filter_name == 'no_extreme_momentum':
         return no_extreme_momentum_filter(score_df, liquidity_quantile=liquidity_quantile, sigma_quantile=sigma_quantile).sort_values('score', ascending=False).reset_index(drop=True)
     if filter_name == 'consensus':
@@ -333,6 +454,10 @@ def apply_filter(score_df, filter_name, liquidity_quantile=0.20, sigma_quantile=
         return stable_topk_rerank_filter(score_df, k=30, liquidity_quantile=liquidity_quantile, sigma_quantile=sigma_quantile, variant='defensive')
     if filter_name == 'stable_top30_rerank_lgb_anchor':
         return stable_topk_rerank_filter(score_df, k=30, liquidity_quantile=liquidity_quantile, sigma_quantile=sigma_quantile, variant='lgb_anchor')
+    if filter_name == 'legal_minrisk':
+        return legal_minrisk_filter(score_df)
+    if filter_name == 'legal_minrisk_hardened':
+        return legal_minrisk_hardened_filter(score_df)
     if filter_name == 'regime_liquidity_risk_off':
         if _is_extreme_risk_off(score_df):
             return stable_topk_rerank_filter(

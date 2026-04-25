@@ -383,7 +383,7 @@ final_adoption = keep stable threshold protection line; no oracle, no reranker
 ### Phase 5：Docker 与提交
 
 - [x] 按官方结构整理 `app/code/src`、`app/data`、`app/model`、`app/output`、`app/temp`、`app/init.sh`、`app/train.sh`、根目录 `test.sh` 和 `readme.md`。
-- [x] Docker 镜像命名为 `bdc2025`。
+- [x] Docker 镜像命名为 `bdc2026`。
 - [x] `output/result.csv` 已切换到 `regime_liquidity_risk_off` 高分候选。
 - [x] 本地完整 `uv run python app/code/src/train.py -> app/code/src/test.py -> test/score_self.py` 可复现 `score_self.py=0.12018139687305522`。
 - [x] 保护线已备份到 `temp/result_protection_stable_equal_20260425.csv`。
@@ -599,15 +599,15 @@ app/output/result.csv
 构建镜像：
 
 ```bash
-docker build -t bdc2025:latest .
+docker build -t bdc2026:latest .
 # 或者：
-docker buildx build --platform linux/amd64 -t bdc2025:latest --load .
+docker buildx build --platform linux/amd64 -t bdc2026:latest --load .
 ```
 
 容器内训练与推理仍然使用同一套 `uv` 命令：
 
 ```bash
-docker run --rm -it --gpus all -v "$PWD/app/data:/app/data" -v "$PWD/app/output:/app/output" -v "$PWD/app/temp:/app/temp" bdc2025:latest bash
+docker run --rm -it --gpus all -v "$PWD/app/data:/app/data" -v "$PWD/app/output:/app/output" -v "$PWD/app/temp:/app/temp" bdc2026:latest bash
 bash app/train.sh
 bash test.sh
 ```
@@ -615,7 +615,7 @@ bash test.sh
 只验证推理入口：
 
 ```bash
-docker run --rm --gpus all --network none -v "$PWD/app/data:/app/data" -v "$PWD/app/output:/app/output" -v "$PWD/app/temp:/app/temp" bdc2025:latest bash test.sh
+docker run --rm --gpus all --network none -v "$PWD/app/data:/app/data" -v "$PWD/app/output:/app/output" -v "$PWD/app/temp:/app/temp" bdc2026:latest bash test.sh
 ```
 
 期望输出：
@@ -644,10 +644,10 @@ uv run python test/score_self.py
 导出镜像：
 
 ```bash
-docker save -o team_name.tar bdc2025:latest
+docker save -o team_name.tar bdc2026:latest
 ```
 
-提交前用 `docker images` 和 `docker inspect bdc2025:latest` 确认镜像名、大小和入口脚本符合官方要求。
+提交前用 `docker images` 和 `docker inspect bdc2026:latest` 确认镜像名、大小和入口脚本符合官方要求。
 
 ## 复现注意事项
 

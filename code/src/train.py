@@ -28,9 +28,36 @@ def set_seed(seed=42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 def _build_label_and_clean(processed, drop_small_open=True):
-    """统一构建标签并清洗无效样本。"""
-    processed['open_t1'] = processed.groupby('股票代码')['开盘'].shift(-1)
-    processed['open_t5'] = processed.groupby('股票代码')['开盘'].shift(-5)
+    """Build scorer-equivalent labels with the global market trading calendar."""
+    processed = processed.copy()
+    processed['日期'] = pd.to_datetime(processed['日期'])
+    processed['股票代码'] = processed['股票代码'].astype(str).str.zfill(6)
+
+    all_dates = pd.Index(sorted(processed['日期'].dropna().unique()))
+    date_map = pd.DataFrame({
+        '日期': all_dates,
+        '_date_idx': np.arange(len(all_dates), dtype=np.int64),
+    })
+
+    processed = processed.merge(date_map, on='日期', how='left')
+    open_base = processed[['股票代码', '_date_idx', '开盘']].copy()
+
+    open_t1 = open_base.rename(columns={'开盘': 'open_t1'})
+    open_t1['_date_idx'] -= 1
+
+    open_t5 = open_base.rename(columns={'开盘': 'open_t5'})
+    open_t5['_date_idx'] -= 5
+
+    processed = processed.merge(
+        open_t1[['股票代码', '_date_idx', 'open_t1']],
+        on=['股票代码', '_date_idx'],
+        how='left',
+    )
+    processed = processed.merge(
+        open_t5[['股票代码', '_date_idx', 'open_t5']],
+        on=['股票代码', '_date_idx'],
+        how='left',
+    )
 
     # 过滤无效开盘价，避免收益率极端爆炸
     if drop_small_open:
@@ -39,7 +66,7 @@ def _build_label_and_clean(processed, drop_small_open=True):
     processed['label'] = (processed['open_t5'] - processed['open_t1']) / (processed['open_t1'] + 1e-12)
     processed = processed.dropna(subset=['label']).copy()
 
-    processed.drop(columns=['open_t1', 'open_t5'], inplace=True)
+    processed.drop(columns=['open_t1', 'open_t5', '_date_idx'], inplace=True)
     return processed
 
 

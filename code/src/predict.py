@@ -17,7 +17,7 @@ from model import StockTransformer
 from portfolio_utils import build_weight_portfolio, select_candidates as shared_select_candidates
 
 
-PREDICT_CACHE_VERSION = 1
+PREDICT_CACHE_VERSION = 3
 
 
 def _file_fingerprint(path):
@@ -31,6 +31,8 @@ def _file_fingerprint(path):
 
 def _build_predict_cache_path(data_file, scaler_path):
     predict_cfg = config.get('predict', {})
+    if os.environ.get('BDC_DISABLE_PREDICT_CACHE') == '1':
+        return None
     if not predict_cfg.get('use_cache', True):
         return None
 
@@ -52,6 +54,10 @@ def _build_predict_cache_path(data_file, scaler_path):
 
 
 def _resolve_model_dir():
+    override_dir = os.environ.get('BDC_MODEL_DIR')
+    if override_dir:
+        return override_dir
+
     preferred_dir = config['output_dir']
     required_files = ['best_model.pth', 'scaler.pkl']
     if all(os.path.exists(os.path.join(preferred_dir, name)) for name in required_files):
@@ -178,10 +184,23 @@ def build_inference_sequences(data, features, sequence_length, latest_date):
 
 
 def build_risk_frame(raw_df):
-    hist = raw_df.groupby('股票代码', sort=False).tail(21).copy()
+    hist = raw_df.groupby('股票代码', sort=False).tail(80).copy()
     if hist.empty:
-        return pd.DataFrame(columns=['stock_id', 'sigma20', 'median_amount20', 'ret5', 'ret20', 'amp20'])
+        return pd.DataFrame(columns=[
+            'stock_id',
+            'sigma20',
+            'median_amount20',
+            'ret1',
+            'ret5',
+            'ret20',
+            'amp20',
+            'beta60',
+            'downside_beta60',
+            'idio_vol60',
+            'max_drawdown20',
+        ])
 
+    hist = hist.sort_values(['日期', '股票代码']).copy()
     hist['收盘'] = hist['收盘'].astype(float)
     hist['最高'] = hist['最高'].astype(float)
     hist['最低'] = hist['最低'].astype(float)
@@ -189,9 +208,12 @@ def build_risk_frame(raw_df):
 
     hist['ret1'] = hist.groupby('股票代码', sort=False)['收盘'].pct_change(fill_method=None)
     hist['close_lag5'] = hist.groupby('股票代码', sort=False)['收盘'].shift(5)
+    hist['market_ret1'] = hist.groupby('日期', sort=False)['ret1'].transform('mean')
 
     grouped = hist.groupby('股票代码', sort=False)
-    agg = grouped.agg(
+    recent20 = grouped.tail(21).copy()
+    grouped20 = recent20.groupby('股票代码', sort=False)
+    agg = grouped20.agg(
         sigma20=('ret1', 'std'),
         median_amount20=('成交额', 'median'),
         first_close=('收盘', 'first'),
@@ -209,6 +231,7 @@ def build_risk_frame(raw_df):
     risk = pd.DataFrame(index=agg.index)
     risk['sigma20'] = agg['sigma20'].fillna(0.0).to_numpy(dtype=np.float64)
     risk['median_amount20'] = agg['median_amount20'].fillna(0.0).to_numpy(dtype=np.float64)
+    risk['ret1'] = latest['ret1'].fillna(0.0).to_numpy(dtype=np.float64)
     risk['ret5'] = np.where(row_count >= 6, last_close / (close_lag5 + 1e-12) - 1.0, 0.0)
     risk['ret20'] = np.where(row_count >= 2, last_close / (first_close + 1e-12) - 1.0, 0.0)
     risk['amp20'] = (
@@ -216,7 +239,52 @@ def build_risk_frame(raw_df):
         / (last_close + 1e-12)
     )
 
+    beta_rows = []
+    for stock_id, group in grouped:
+        group = group.tail(61).dropna(subset=['ret1', 'market_ret1']).copy()
+        if len(group) < 20:
+            beta_rows.append((stock_id, 0.0, 0.0, 0.0, 0.0))
+            continue
+
+        x = group['market_ret1'].to_numpy(dtype=np.float64)
+        y = group['ret1'].to_numpy(dtype=np.float64)
+        x_centered = x - x.mean()
+        var_x = float(np.dot(x_centered, x_centered) / max(len(x_centered), 1))
+        beta = float(np.cov(y, x, ddof=0)[0, 1] / (var_x + 1e-12))
+
+        downside = group[group['market_ret1'] < 0]
+        if len(downside) >= 8:
+            dx = downside['market_ret1'].to_numpy(dtype=np.float64)
+            dy = downside['ret1'].to_numpy(dtype=np.float64)
+            dx_centered = dx - dx.mean()
+            var_dx = float(np.dot(dx_centered, dx_centered) / max(len(dx_centered), 1))
+            downside_beta = float(np.cov(dy, dx, ddof=0)[0, 1] / (var_dx + 1e-12))
+        else:
+            downside_beta = beta
+
+        residual = y - beta * x
+        idio_vol = float(np.std(residual))
+
+        close20 = group['收盘'].tail(20).to_numpy(dtype=np.float64)
+        if close20.size == 0:
+            max_drawdown = 0.0
+        else:
+            running_max = np.maximum.accumulate(close20)
+            drawdowns = close20 / (running_max + 1e-12) - 1.0
+            max_drawdown = float(abs(np.min(drawdowns)))
+
+        beta_rows.append((stock_id, beta, downside_beta, idio_vol, max_drawdown))
+
+    beta_df = pd.DataFrame(
+        beta_rows,
+        columns=['stock_id', 'beta60', 'downside_beta60', 'idio_vol60', 'max_drawdown20'],
+    ).set_index('stock_id')
+    risk = risk.join(beta_df, how='left')
+
     risk = risk.reset_index().rename(columns={'股票代码': 'stock_id'})
+    risk['amount20'] = risk['median_amount20']
+    risk['return_1'] = risk['ret1']
+    risk['return_5'] = risk['ret5']
     return risk
 
 
@@ -248,8 +316,7 @@ def prepare_inference_artifacts(raw_df, stockid2idx, scaler, data_file, scaler_p
     inference_df = build_latest_inference_frame(processed, sequence_stock_ids, latest_date)
     risk_df = build_risk_frame(raw_df)
 
-    latest_processed = processed[processed['日期'] == latest_date]
-    breadth = float(latest_processed['return_1'].gt(0).mean()) if 'return_1' in latest_processed.columns else 1.0
+    breadth = float(risk_df['ret1'].gt(0).mean()) if 'ret1' in risk_df.columns and len(risk_df) else 1.0
 
     artifacts = {
         'latest_date': pd.Timestamp(latest_date),
@@ -313,8 +380,8 @@ def score_soft_weights(candidates, k=5, tau=1.0, max_weight=0.50, min_weight=0.0
     return out
 
 
-def select_candidates(score_df):
-    return shared_select_candidates(score_df, post_cfg=config.get('postprocess', {}))
+def select_candidates(score_df, post_cfg=None):
+    return shared_select_candidates(score_df, post_cfg=post_cfg or config.get('postprocess', {}))
 
 
 def select_weighting_func(weighting_name):
@@ -340,6 +407,1513 @@ def zscore(x):
     return (x - x.mean()) / (x.std() + 1e-9)
 
 
+def rank_pct_score(x):
+    return pd.Series(np.asarray(x, dtype=np.float64)).rank(pct=True, method='average').to_numpy(dtype=np.float64)
+
+
+def normalize_score(x, mode):
+    if mode == 'rank_pct':
+        return rank_pct_score(x)
+    if mode == 'none':
+        return np.asarray(x, dtype=np.float64)
+    return zscore(x)
+
+
+def _rank_pct(series):
+    return series.astype(float).rank(pct=True, method='average')
+
+
+def _safe_numeric(score_df, col, default=0.0):
+    if col not in score_df.columns:
+        return pd.Series(default, index=score_df.index, dtype=np.float64)
+    values = pd.to_numeric(score_df[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+    fill = values.median() if values.notna().any() else default
+    return values.fillna(fill).astype(np.float64)
+
+
+def add_selector_scores(score_df):
+    out = score_df.copy()
+    out['lgb_norm'] = _rank_pct(_safe_numeric(out, 'lgb'))
+    out['tf_norm'] = _rank_pct(_safe_numeric(out, 'transformer'))
+    out['rank_disagreement'] = (out['lgb_norm'] - out['tf_norm']).abs()
+    out['disagreement'] = out['rank_disagreement']
+    out['liq_rank'] = _rank_pct(_safe_numeric(out, 'median_amount20'))
+    out['sigma_rank'] = _rank_pct(_safe_numeric(out, 'sigma20'))
+    out['amp_rank'] = _rank_pct(_safe_numeric(out, 'amp20'))
+    out['ret1_rank'] = _rank_pct(_safe_numeric(out, 'ret1'))
+    out['ret5_rank'] = _rank_pct(_safe_numeric(out, 'ret5'))
+    out['beta60_rank'] = _rank_pct(_safe_numeric(out, 'beta60'))
+    out['downside_beta60_rank'] = _rank_pct(_safe_numeric(out, 'downside_beta60'))
+    out['max_drawdown20_rank'] = _rank_pct(_safe_numeric(out, 'max_drawdown20'))
+
+    out['high_vol_flag'] = (out['sigma_rank'] > 0.85) | (out['amp_rank'] > 0.85)
+    out['extreme_momo_flag'] = out['ret5_rank'] > 0.90
+    out['overheat_flag'] = (out['ret5_rank'] > 0.75) & (out['amp_rank'] > 0.75)
+    out['reversal_flag'] = (out['ret5_rank'] > 0.70) & (out['ret1_rank'] < 0.30)
+    out['tail_risk_flag'] = (
+        out['high_vol_flag']
+        | (out['downside_beta60_rank'] > 0.85)
+        | (out['max_drawdown20_rank'] > 0.85)
+    )
+
+    out['sigma_penalty'] = ((out['sigma_rank'] - 0.75) / 0.25).clip(lower=0.0)
+    out['amp_penalty'] = ((out['amp_rank'] - 0.75) / 0.25).clip(lower=0.0)
+    out['ret5_high_penalty'] = ((out['ret5_rank'] - 0.90) / 0.10).clip(lower=0.0)
+    out['ret5_low_penalty'] = ((0.10 - out['ret5_rank']) / 0.10).clip(lower=0.0)
+    out['bad_pick_risk'] = (
+        0.25 * out['sigma_penalty']
+        + 0.25 * out['amp_penalty']
+        + 0.20 * out['ret5_high_penalty']
+        + 0.15 * out['ret5_low_penalty']
+        + 0.15 * out['rank_disagreement']
+    )
+
+    out['score_lgb_only'] = out['lgb_norm']
+    out['score_balanced'] = (
+        0.70 * out['lgb_norm']
+        + 0.30 * out['tf_norm']
+        - 0.10 * out['rank_disagreement']
+    )
+    out['score_conservative'] = (
+        0.30 * out['lgb_norm']
+        + 0.70 * out['tf_norm']
+        - 0.20 * out['rank_disagreement']
+    )
+    out['score_conservative_softrisk'] = (
+        out['score_conservative']
+        - 0.05 * out['sigma_penalty']
+        - 0.05 * out['amp_penalty']
+        - 0.03 * out['ret5_high_penalty']
+        - 0.03 * out['ret5_low_penalty']
+    )
+    out['vol_hinge'] = ((out['sigma_rank'] - 0.80) / 0.20).clip(lower=0.0)
+    out['amp_hinge'] = ((out['amp_rank'] - 0.80) / 0.20).clip(lower=0.0)
+    out['reversal_penalty'] = (
+        ((out['ret5_rank'] - 0.70) / 0.30).clip(lower=0.0)
+        * ((0.35 - out['ret1_rank']) / 0.35).clip(lower=0.0)
+    )
+    out['risk_disagreement_penalty'] = (
+        0.5 * out['vol_hinge']
+        + 0.5 * out['amp_hinge']
+    ) * out['rank_disagreement']
+    out['score_conservative_softrisk_v2'] = (
+        out['score_conservative']
+        - 0.06 * out['risk_disagreement_penalty']
+        - 0.04 * out['reversal_penalty']
+    )
+    out['score_defensive'] = (
+        0.20 * out['lgb_norm']
+        + 0.60 * out['tf_norm']
+        + 0.15 * out['liq_rank']
+        - 0.20 * out['sigma_rank']
+        - 0.15 * out['amp_rank']
+    )
+    out['score_defensive_v2'] = (
+        0.75 * out['tf_norm']
+        + 0.10 * out['lgb_norm']
+        + 0.10 * out['liq_rank']
+        - 0.10 * out['sigma_rank']
+        - 0.10 * out['beta60_rank']
+        - 0.10 * out['downside_beta60_rank']
+        - 0.05 * out['max_drawdown20_rank']
+    )
+    out['score_legal_minrisk'] = (
+        0.35 * out['tf_norm']
+        + 0.15 * out['lgb_norm']
+        + 0.20 * out['liq_rank']
+        - 0.15 * out['sigma_rank']
+        - 0.10 * out['downside_beta60_rank']
+        - 0.10 * out['max_drawdown20_rank']
+        - 0.05 * out['amp_rank']
+    )
+    cvar20_rank = out['cvar20_rank'] if 'cvar20_rank' in out.columns else out['max_drawdown20_rank']
+    out['tail_risk_score'] = (
+        0.25 * out['sigma_rank']
+        + 0.20 * out['amp_rank']
+        + 0.20 * out['downside_beta60_rank']
+        + 0.20 * out['max_drawdown20_rank']
+        + 0.15 * cvar20_rank
+    )
+    out['uncertainty_score'] = (
+        0.50 * out['disagreement']
+        + 0.30 * _safe_numeric(out, 'oof_error_bucket_rank', default=0.5)
+        + 0.20 * _safe_numeric(out, 'regime_error_rank', default=0.5)
+    )
+    return out
+
+
+def infer_regime(score_df):
+    if len(score_df) == 0:
+        return 'mixed_defensive', {}
+
+    ret1 = _safe_numeric(score_df, 'ret1')
+    ret5 = _safe_numeric(score_df, 'ret5')
+    sigma20 = _safe_numeric(score_df, 'sigma20')
+    breadth_1d = float(ret1.gt(0).mean())
+    breadth_5d = float(ret5.gt(0).mean())
+    median_ret1 = float(ret1.median())
+    median_ret5 = float(ret5.median())
+    high_vol_ratio = float(sigma20.gt(sigma20.quantile(0.75)).mean())
+
+    if (
+        breadth_1d >= 0.58
+        and breadth_5d >= 0.55
+        and median_ret1 > 0
+        and median_ret5 > 0.005
+    ):
+        regime = 'risk_on_strict'
+    elif breadth_1d >= 0.50 and breadth_5d >= 0.50 and median_ret5 > 0:
+        regime = 'neutral_positive'
+    elif breadth_1d < 0.35 or median_ret1 < -0.005:
+        regime = 'risk_off'
+    else:
+        regime = 'mixed_defensive'
+
+    return regime, {
+        'breadth_1d': breadth_1d,
+        'breadth_5d': breadth_5d,
+        'median_ret1': median_ret1,
+        'median_ret5': median_ret5,
+        'high_vol_ratio': high_vol_ratio,
+    }
+
+
+def _top_overlap(score_df, col_a='lgb_norm', col_b='tf_norm', n=20):
+    if len(score_df) == 0 or col_a not in score_df.columns or col_b not in score_df.columns:
+        return 0.0
+    k = min(n, len(score_df))
+    a = set(score_df.nlargest(k, col_a)['stock_id'])
+    b = set(score_df.nlargest(k, col_b)['stock_id'])
+    return float(len(a & b) / max(k, 1))
+
+
+def _score_gap(candidates, score_col='score'):
+    if len(candidates) <= 5:
+        return 0.0
+    scores = candidates.sort_values(score_col, ascending=False)[score_col].reset_index(drop=True)
+    next_end = min(20, len(scores))
+    return float(scores.iloc[:5].mean() - scores.iloc[5:next_end].mean())
+
+
+def _branch_candidates(score_df, selector_cfg, branch_name, regime=None):
+    if branch_name == 'independent_union_rerank':
+        return _union_rerank_candidates(score_df, selector_cfg, regime=regime)
+    if branch_name == 'legal_plus_1alpha':
+        return _legal_plus_1alpha_candidates(score_df, selector_cfg, regime=regime)
+
+    branch_cfg = selector_cfg.get('branches', {}).get(branch_name)
+    if branch_cfg is None:
+        return pd.DataFrame(columns=score_df.columns), {}
+
+    score_col = branch_cfg.get('score_col', 'score_lgb_only')
+    if score_col not in score_df.columns:
+        return pd.DataFrame(columns=score_df.columns), branch_cfg
+
+    branch_df = score_df.copy()
+    branch_df['score'] = branch_df[score_col]
+    filter_name = branch_cfg.get('filter', 'nofilter')
+    filtered = shared_select_candidates(
+        branch_df,
+        post_cfg={
+            'filter': filter_name,
+            'liquidity_quantile': branch_cfg.get('liquidity_quantile', 0.30),
+            'sigma_quantile': branch_cfg.get('sigma_quantile', 0.70),
+        },
+    )
+    return filtered, branch_cfg
+
+
+def _full_rank_quality(score_df, score_col):
+    if score_col not in score_df.columns or len(score_df) == 0:
+        return pd.Series(0.0, index=score_df.index, dtype=np.float64)
+    values = pd.to_numeric(score_df[score_col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+    values = values.fillna(values.median() if values.notna().any() else 0.0)
+    return values.rank(pct=True, method='average').astype(np.float64)
+
+
+def _union_risk_budget(selector_cfg, regime):
+    budget_cfg = selector_cfg.get('union_rerank', {}).get('risk_budget', {})
+    default = {
+        'max_tail_risk_count': 2,
+        'max_high_vol_count': 2,
+        'max_very_high_vol_count': 1,
+        'max_very_tail_count': 1,
+        'max_alpha_exception_count': 2,
+        'max_branch_only_alpha_count': 1,
+    }
+    out = default.copy()
+    out.update(budget_cfg.get(regime, {}))
+    return out
+
+
+def _candidate_flag(row, col):
+    return bool(row.get(col, False))
+
+
+def _selected_counts(rows):
+    non_exception = [row for row in rows if not _candidate_flag(row, 'alpha_exception')]
+    return {
+        'tail_risk_count': sum(_candidate_flag(row, 'tail_risk_flag') for row in non_exception),
+        'high_vol_count': sum(_candidate_flag(row, 'high_vol_flag') for row in non_exception),
+        'very_high_vol_count': sum(_candidate_flag(row, 'very_high_vol_flag') for row in non_exception),
+        'very_tail_count': sum(_candidate_flag(row, 'very_tail_flag') for row in non_exception),
+        'alpha_exception_count': sum(_candidate_flag(row, 'alpha_exception') for row in rows),
+        'branch_only_alpha_count': sum(_candidate_flag(row, 'branch_only_alpha_flag') for row in non_exception),
+        'stable_count': sum(_candidate_flag(row, 'stable_candidate') for row in rows),
+        'consensus_count': sum(float(row.get('consensus_count', 0.0)) >= 2.0 for row in rows),
+    }
+
+
+def _within_union_budget(rows, budget):
+    counts = _selected_counts(rows)
+    return (
+        counts['tail_risk_count'] <= int(budget.get('max_tail_risk_count', 5))
+        and counts['high_vol_count'] <= int(budget.get('max_high_vol_count', 5))
+        and counts['very_high_vol_count'] <= int(budget.get('max_very_high_vol_count', 5))
+        and counts['very_tail_count'] <= int(budget.get('max_very_tail_count', 5))
+        and counts['alpha_exception_count'] <= int(budget.get('max_alpha_exception_count', 5))
+        and counts['branch_only_alpha_count'] <= int(budget.get('max_branch_only_alpha_count', 5))
+    )
+
+
+def _constrained_union_pick(pool, selector_cfg, regime, k=5):
+    budget = _union_risk_budget(selector_cfg, regime)
+    rows = pool.sort_values('rerank_score', ascending=False).to_dict('records')
+    selected = []
+    selected_ids = set()
+
+    shape_cfg = selector_cfg.get('union_rerank', {}).get('portfolio_shape', {}).get(regime, {})
+    max_alpha_slots = int(shape_cfg.get('max_pure_alpha_slots', 0))
+    if max_alpha_slots > 0:
+        alpha_rows = (
+            pool[pool['alpha_exception'].astype(bool)]
+            .sort_values(['alpha_score', 'rerank_score'], ascending=False)
+            .to_dict('records')
+        )
+        for row in alpha_rows:
+            stock_id = row.get('stock_id')
+            if stock_id in selected_ids:
+                continue
+            proposal = selected + [row]
+            if _within_union_budget(proposal, budget):
+                selected.append(row)
+                selected_ids.add(stock_id)
+            if len(selected) >= min(max_alpha_slots, k):
+                break
+
+    stable_slots = int(shape_cfg.get('min_stable_slots', 0))
+    if regime == 'risk_off' and max_alpha_slots > 0:
+        stable_slots = max(stable_slots, k - len(selected))
+    if stable_slots > 0 and 'stable_fill_score' in pool.columns:
+        stable_rows = (
+            pool[pool['stable_candidate'].astype(bool)]
+            .sort_values(['stable_fill_score', 'rerank_score'], ascending=False)
+            .to_dict('records')
+        )
+        for row in stable_rows:
+            stock_id = row.get('stock_id')
+            if stock_id in selected_ids:
+                continue
+            proposal = selected + [row]
+            if _within_union_budget(proposal, budget):
+                selected.append(row)
+                selected_ids.add(stock_id)
+            if len(selected) >= k or _selected_counts(selected)['stable_count'] >= stable_slots:
+                break
+
+    if len(selected) >= k:
+        return selected[:k]
+
+    for row in rows:
+        stock_id = row.get('stock_id')
+        if stock_id in selected_ids:
+            continue
+        proposal = selected + [row]
+        if _within_union_budget(proposal, budget):
+            selected.append(row)
+            selected_ids.add(stock_id)
+            if len(selected) >= k:
+                break
+
+    if len(selected) < k:
+        relaxed = budget.copy()
+        relaxed['max_tail_risk_count'] = int(relaxed.get('max_tail_risk_count', 5)) + 1
+        relaxed['max_high_vol_count'] = int(relaxed.get('max_high_vol_count', 5)) + 1
+        relaxed['max_very_tail_count'] = int(relaxed.get('max_very_tail_count', 5)) + 1
+        for row in rows:
+            stock_id = row.get('stock_id')
+            if stock_id in selected_ids:
+                continue
+            proposal = selected + [row]
+            if _within_union_budget(proposal, relaxed):
+                selected.append(row)
+                selected_ids.add(stock_id)
+            if len(selected) >= k:
+                break
+
+    if len(selected) < k:
+        for row in rows:
+            stock_id = row.get('stock_id')
+            if stock_id in selected_ids:
+                continue
+            selected.append(row)
+            selected_ids.add(stock_id)
+            if len(selected) >= k:
+                break
+    return selected
+
+
+def _is_bad_tail_candidate(row):
+    if _candidate_flag(row, 'alpha_exception'):
+        return False
+    return (
+        _candidate_flag(row, 'very_tail_flag')
+        or _candidate_flag(row, 'very_high_vol_flag')
+        or (
+            _candidate_flag(row, 'tail_risk_flag')
+            and _candidate_flag(row, 'high_vol_flag')
+            and float(row.get('consensus_count', 0.0)) <= 1.0
+        )
+        or (
+            float(row.get('rank_disagreement', 0.0)) >= 0.25
+            and _candidate_flag(row, 'branch_only_alpha_flag')
+        )
+    )
+
+
+def _replace_bad_tail_candidates(selected, pool, selector_cfg, regime):
+    replace_cfg = selector_cfg.get('union_rerank', {}).get('replacement', {})
+    if not replace_cfg.get('enabled', True):
+        return selected
+
+    alpha_tolerance = float(replace_cfg.get('alpha_tolerance', 0.15))
+    min_risk_improvement = float(replace_cfg.get('min_risk_improvement', 0.20))
+    require_safe = bool(replace_cfg.get('require_safe_branch_support', True))
+    budget = _union_risk_budget(selector_cfg, regime)
+    selected = [dict(row) for row in selected]
+
+    candidates = pool.sort_values('rerank_score', ascending=False).to_dict('records')
+    for idx, row in enumerate(list(selected)):
+        if not _is_bad_tail_candidate(row):
+            continue
+
+        selected_ids = {item['stock_id'] for pos, item in enumerate(selected) if pos != idx}
+        replacement = None
+        for cand in candidates:
+            stock_id = cand.get('stock_id')
+            if stock_id in selected_ids or stock_id == row.get('stock_id'):
+                continue
+            if require_safe and not _candidate_flag(cand, 'safe_branch_support'):
+                continue
+            if float(cand.get('risk_score', 1.0)) > float(row.get('risk_score', 1.0)) - min_risk_improvement:
+                continue
+            if float(cand.get('alpha_score', 0.0)) < float(row.get('alpha_score', 0.0)) - alpha_tolerance:
+                continue
+            proposal = selected[:idx] + [cand] + selected[idx + 1:]
+            if not _within_union_budget(proposal, budget):
+                continue
+            replacement = cand
+            break
+
+        if replacement is not None:
+            replacement = dict(replacement)
+            replacement['replacement_reason'] = f"replace_bad_tail:{row.get('stock_id')}"
+            row['replacement_reason'] = 'removed_bad_tail'
+            selected[idx] = replacement
+
+    return selected
+
+
+def _union_rerank_candidates(score_df, selector_cfg, regime=None):
+    branch_cfg = selector_cfg.get('branches', {}).get('independent_union_rerank', {})
+    union_cfg = selector_cfg.get('union_rerank', {})
+    if not union_cfg.get('enabled', False):
+        return pd.DataFrame(columns=score_df.columns), branch_cfg
+
+    pool_cfg = union_cfg.get('candidate_pool', {})
+    if not pool_cfg:
+        return pd.DataFrame(columns=score_df.columns), branch_cfg
+
+    branch_sets = {}
+    pool_ids = set()
+    for source_branch, topn in pool_cfg.items():
+        if source_branch == 'independent_union_rerank':
+            continue
+        candidates, source_cfg = _branch_candidates(score_df, selector_cfg, source_branch)
+        if len(candidates) == 0:
+            branch_sets[source_branch] = set()
+            continue
+        ids = candidates.head(int(topn))['stock_id'].astype(str).tolist()
+        branch_sets[source_branch] = set(ids)
+        pool_ids.update(ids)
+
+    if not pool_ids:
+        return pd.DataFrame(columns=score_df.columns), branch_cfg
+
+    pool = score_df[score_df['stock_id'].astype(str).isin(pool_ids)].copy()
+    if len(pool) < 5:
+        return pool.sort_values('score', ascending=False).reset_index(drop=True), branch_cfg
+
+    branch_score_cols = {
+        'conservative_softrisk_v2': 'score_conservative_softrisk_v2',
+        'conservative_softrisk_v2_strict': 'score_conservative_softrisk_v2',
+        'lgb_only_guarded': 'score_lgb_only',
+        'balanced_guarded': 'score_balanced',
+        'defensive_v2_strict': 'score_defensive_v2',
+        'legal_minrisk_hardened': 'score_legal_minrisk',
+    }
+    for source_branch, score_col in branch_score_cols.items():
+        rank_col = f'{source_branch}_rank_quality'
+        rank_map = dict(zip(score_df['stock_id'].astype(str), _full_rank_quality(score_df, score_col)))
+        pool[rank_col] = pool['stock_id'].astype(str).map(rank_map).fillna(0.0).astype(np.float64)
+
+    source_names = list(pool_cfg.keys())
+    for source_branch in source_names:
+        pool[f'in_{source_branch}'] = pool['stock_id'].astype(str).isin(branch_sets.get(source_branch, set()))
+    pool['consensus_count'] = pool[[f'in_{name}' for name in source_names]].sum(axis=1).astype(float)
+    pool['branch_sources'] = pool.apply(
+        lambda row: '|'.join([name for name in source_names if bool(row.get(f'in_{name}', False))]),
+        axis=1,
+    )
+
+    branch_rank_bonus = (
+        0.50 * (pool['consensus_count'] / max(float(len(source_names)), 1.0))
+        + 0.50 * pool[[f'{name}_rank_quality' for name in branch_score_cols if f'{name}_rank_quality' in pool.columns]].max(axis=1)
+    )
+    pool['alpha_score'] = (
+        0.35 * _safe_numeric(pool, 'score_conservative_softrisk_v2')
+        + 0.25 * _safe_numeric(pool, 'lgb_norm')
+        + 0.20 * _safe_numeric(pool, 'score_balanced')
+        + 0.10 * _safe_numeric(pool, 'tf_norm')
+        + 0.10 * branch_rank_bonus
+    )
+    pool['alpha_rank_num'] = pool['alpha_score'].rank(ascending=False, method='first')
+
+    full_conservative_rank = _safe_numeric(score_df, 'score_conservative_softrisk_v2').rank(ascending=False, method='first')
+    full_lgb_rank = _safe_numeric(score_df, 'score_lgb_only').rank(ascending=False, method='first')
+    conservative_rank_map = dict(zip(score_df['stock_id'].astype(str), full_conservative_rank))
+    lgb_rank_map = dict(zip(score_df['stock_id'].astype(str), full_lgb_rank))
+    pool['conservative_rank_num'] = pool['stock_id'].astype(str).map(conservative_rank_map).fillna(9999).astype(float)
+    pool['lgb_rank_num'] = pool['stock_id'].astype(str).map(lgb_rank_map).fillna(9999).astype(float)
+
+    pool['very_high_vol_flag'] = (
+        (_safe_numeric(pool, 'sigma_rank') > 0.95)
+        | (_safe_numeric(pool, 'amp_rank') > 0.95)
+    )
+    pool['very_tail_flag'] = (
+        (_safe_numeric(pool, 'downside_beta60_rank') > 0.90)
+        | (_safe_numeric(pool, 'max_drawdown20_rank') > 0.90)
+    )
+    pool['alpha_exception'] = (
+        ((pool['conservative_rank_num'] <= 3) & (pool['lgb_rank_num'] <= 25))
+        | ((pool['conservative_rank_num'] <= 2) & (_safe_numeric(pool, 'tf_norm') >= 0.95))
+    )
+    pool['branch_only_alpha_flag'] = (
+        (pool['consensus_count'] <= 1)
+        & (pool['alpha_rank_num'] <= 15)
+        & ~pool['alpha_exception'].astype(bool)
+    )
+    pool['safe_branch_support'] = (
+        pool.get('in_defensive_v2_strict', False).astype(bool)
+        | pool.get('in_legal_minrisk_hardened', False).astype(bool)
+        | (_safe_numeric(pool, 'score_defensive_v2') >= _safe_numeric(score_df, 'score_defensive_v2').quantile(0.85))
+    )
+    pool['stable_candidate'] = (
+        pool['safe_branch_support'].astype(bool)
+        & ~pool['tail_risk_flag'].astype(bool)
+        & ~pool['reversal_flag'].astype(bool)
+    )
+
+    pool['risk_score'] = (
+        0.30 * pool['tail_risk_flag'].astype(float)
+        + 0.25 * pool['very_tail_flag'].astype(float)
+        + 0.20 * pool['high_vol_flag'].astype(float)
+        + 0.15 * pool['very_high_vol_flag'].astype(float)
+        + 0.10 * _safe_numeric(pool, 'rank_disagreement')
+    )
+    pool['stable_fill_score'] = (
+        0.50 * _safe_numeric(pool, 'lgb_norm')
+        + 0.20 * _safe_numeric(pool, 'score_balanced')
+        + 0.08 * _safe_numeric(pool, 'liq_rank')
+        + 0.15 * _safe_numeric(pool, 'ret1_rank')
+        + 0.08 * pool.get('in_lgb_only_guarded', False).astype(float)
+        + 0.05 * pool.get('in_legal_minrisk_hardened', False).astype(float)
+        + 0.03 * pool.get('in_balanced_guarded', False).astype(float)
+        - 0.10 * _safe_numeric(pool, 'risk_score')
+    )
+    pool['effective_risk_score'] = pool['risk_score'] * np.where(pool['alpha_exception'].astype(bool), 0.45, 1.0)
+
+    risk_lambda_cfg = union_cfg.get('risk_lambda', {})
+    risk_lambda = float(risk_lambda_cfg.get(regime, risk_lambda_cfg.get('risk_off', 0.75)))
+    pool['consensus_bonus'] = 0.03 * np.minimum(pool['consensus_count'], 3.0)
+    pool['liquidity_bonus'] = 0.06 * _safe_numeric(pool, 'liq_rank')
+    pool['defensive_support_bonus'] = 0.06 * pool['safe_branch_support'].astype(float)
+    pool['score_disagreement_penalty'] = 0.08 * _safe_numeric(pool, 'rank_disagreement')
+    pool['rerank_score'] = (
+        pool['alpha_score']
+        - risk_lambda * pool['effective_risk_score']
+        + pool['consensus_bonus']
+        + pool['liquidity_bonus']
+        + pool['defensive_support_bonus']
+        - pool['score_disagreement_penalty']
+    )
+    pool['score'] = pool['rerank_score']
+    pool['replacement_reason'] = ''
+
+    selected = _constrained_union_pick(pool, selector_cfg, regime or 'risk_off', k=5)
+    selected = _replace_bad_tail_candidates(selected, pool, selector_cfg, regime or 'risk_off')
+    selected_ids = [row['stock_id'] for row in selected]
+    selected_score_map = {row['stock_id']: row['rerank_score'] for row in selected}
+    selected_reason_map = {row['stock_id']: row.get('replacement_reason', '') for row in selected}
+
+    pool['final_selected'] = pool['stock_id'].isin(selected_ids)
+    pool['replacement_reason'] = pool['stock_id'].map(selected_reason_map).fillna(pool['replacement_reason'])
+    pool['union_debug_rank'] = pool['rerank_score'].rank(ascending=False, method='first')
+    pool.attrs['candidate_debug'] = pool.sort_values('rerank_score', ascending=False).copy()
+
+    selected_df = pool[pool['stock_id'].isin(selected_ids)].copy()
+    selected_df['_selected_order'] = selected_df['stock_id'].map({stock_id: idx for idx, stock_id in enumerate(selected_ids)})
+    selected_df['score'] = selected_df['stock_id'].map(selected_score_map).fillna(selected_df['rerank_score'])
+    selected_df = selected_df.sort_values('_selected_order').drop(columns=['_selected_order']).reset_index(drop=True)
+    selected_df.attrs['candidate_debug'] = pool.sort_values('rerank_score', ascending=False).copy()
+    selected_df.attrs['candidate_pool'] = pool.copy()
+    return selected_df, branch_cfg
+
+
+def _best_clean_alpha_candidate(union_candidates, selector_cfg, regime, regime_stats):
+    gate_cfg = selector_cfg.get('gated_union_rerank', {}).get('legal_plus_1alpha', {})
+    if not gate_cfg.get('enabled', True):
+        return None, {}
+
+    veto, veto_reason = _market_hard_veto(regime, regime_stats)
+    if veto:
+        return None, {'legal_plus_reason': veto_reason}
+
+    market_ok, market_reason = _market_enable_gate(regime, regime_stats)
+    if not market_ok:
+        return None, {'legal_plus_reason': f'legal_plus_{market_reason}'}
+
+    pool = union_candidates.attrs.get('candidate_pool') if hasattr(union_candidates, 'attrs') else None
+    if pool is None or len(pool) == 0:
+        return None, {'legal_plus_reason': 'missing_union_pool'}
+
+    pool = pool.copy()
+    full_alpha = _safe_numeric(pool, 'alpha_score')
+    alpha_z = (full_alpha - full_alpha.mean()) / (full_alpha.std(ddof=0) + 1e-9)
+    pool['alpha_score_z'] = alpha_z
+
+    min_z = float(gate_cfg.get('min_best_alpha_z', 1.75))
+    min_consensus = float(gate_cfg.get('min_best_alpha_consensus', 2.0))
+    max_disagreement = float(gate_cfg.get('max_best_alpha_disagreement', 0.25))
+
+    candidates = pool[
+        pool.get('alpha_exception', pd.Series(False, index=pool.index)).astype(bool)
+        & (pool['alpha_score_z'] >= min_z)
+        & (pd.to_numeric(pool.get('consensus_count', pd.Series(0.0, index=pool.index)), errors='coerce').fillna(0.0) >= min_consensus)
+        & ~pool.get('branch_only_alpha_flag', pd.Series(False, index=pool.index)).astype(bool)
+        & ~pool.get('tail_risk_flag', pd.Series(False, index=pool.index)).astype(bool)
+        & ~pool.get('very_tail_flag', pd.Series(False, index=pool.index)).astype(bool)
+        & ~pool.get('very_high_vol_flag', pd.Series(False, index=pool.index)).astype(bool)
+        & (pd.to_numeric(pool.get('rank_disagreement', pd.Series(1.0, index=pool.index)), errors='coerce').fillna(1.0) <= max_disagreement)
+    ].copy()
+
+    if candidates.empty:
+        return None, {
+            'legal_plus_reason': 'no_clean_single_alpha',
+            'best_alpha_score_z': float(pool['alpha_score_z'].max()) if len(pool) else 0.0,
+        }
+
+    market_not_toxic = (
+        float(regime_stats.get('median_ret1', 0.0)) > -0.009
+        and not (
+            float(regime_stats.get('breadth_5d', 0.0)) < 0.40
+            and float(regime_stats.get('median_ret5', 0.0)) < 0.0
+        )
+    )
+    if not market_not_toxic:
+        return None, {'legal_plus_reason': 'market_toxic_for_single_alpha'}
+
+    stable_fill_count = int(
+        union_candidates.get('stable_candidate', pd.Series(False, index=union_candidates.index)).astype(bool).sum()
+    )
+    if regime in {'risk_off', 'mixed_defensive'} and stable_fill_count < 1:
+        return None, {'legal_plus_reason': 'insufficient_stable_support'}
+
+    best = candidates.sort_values(['alpha_score_z', 'alpha_score', 'rerank_score'], ascending=False).iloc[0].copy()
+    return best, {
+        'legal_plus_reason': 'enabled_legal_plus_1alpha',
+        'best_alpha_stock': str(best.get('stock_id')),
+        'best_alpha_score_z': float(best.get('alpha_score_z', 0.0)),
+        'best_alpha_consensus_count': float(best.get('consensus_count', 0.0)),
+    }
+
+
+def _legal_plus_1alpha_candidates(score_df, selector_cfg, regime=None):
+    branch_cfg = selector_cfg.get('branches', {}).get('legal_plus_1alpha', {})
+    regime = regime or infer_regime(score_df)[0]
+    _, regime_stats = infer_regime(score_df)
+
+    union_candidates, _ = _union_rerank_candidates(score_df, selector_cfg, regime=regime)
+    best_alpha, plus_info = _best_clean_alpha_candidate(union_candidates, selector_cfg, regime, regime_stats)
+    if best_alpha is None:
+        empty = pd.DataFrame(columns=score_df.columns)
+        empty.attrs['legal_plus_info'] = plus_info
+        return empty, branch_cfg
+
+    legal_candidates, _ = _branch_candidates(score_df, selector_cfg, 'legal_minrisk_hardened', regime=regime)
+    legal_top = legal_candidates.head(5).copy()
+    if len(legal_top) < 5:
+        empty = pd.DataFrame(columns=score_df.columns)
+        empty.attrs['legal_plus_info'] = {'legal_plus_reason': 'insufficient_legal_candidates'}
+        return empty, branch_cfg
+
+    alpha_id = str(best_alpha['stock_id'])
+    if alpha_id in set(legal_top['stock_id'].astype(str)):
+        out = legal_top.copy()
+        out['legal_plus_score'] = out.get('score_legal_minrisk', out.get('score', 0.0))
+        out = out.reset_index(drop=True)
+        out.attrs['legal_plus_info'] = {**plus_info, 'legal_plus_replaced_stock': ''}
+        if hasattr(union_candidates, 'attrs') and union_candidates.attrs.get('candidate_debug') is not None:
+            out.attrs['candidate_debug'] = union_candidates.attrs['candidate_debug']
+        return out, branch_cfg
+
+    pool = union_candidates.attrs.get('candidate_pool') if hasattr(union_candidates, 'attrs') else pd.DataFrame()
+    alpha_map = {}
+    consensus_map = {}
+    if len(pool):
+        alpha_map = dict(zip(pool['stock_id'].astype(str), _safe_numeric(pool, 'alpha_score')))
+        consensus_map = dict(zip(pool['stock_id'].astype(str), _safe_numeric(pool, 'consensus_count')))
+
+    legal_top['_alpha_for_drop'] = legal_top['stock_id'].astype(str).map(alpha_map).fillna(_safe_numeric(legal_top, 'score_legal_minrisk'))
+    legal_top['_consensus_for_drop'] = legal_top['stock_id'].astype(str).map(consensus_map).fillna(0.0)
+    legal_top['_drop_rank'] = (
+        legal_top['_alpha_for_drop'].rank(method='first', ascending=True)
+        + 0.15 * legal_top['_consensus_for_drop'].rank(method='first', ascending=True)
+        - 0.10 * _safe_numeric(legal_top, 'score_legal_minrisk').rank(method='first', ascending=False)
+    )
+    drop_idx = legal_top.sort_values('_drop_rank', ascending=True).index[0]
+    dropped_stock = str(legal_top.loc[drop_idx, 'stock_id'])
+    kept = legal_top.drop(index=drop_idx).copy()
+
+    alpha_row = score_df[score_df['stock_id'].astype(str) == alpha_id].copy()
+    if alpha_row.empty:
+        alpha_row = pd.DataFrame([best_alpha.to_dict()])
+    alpha_row['legal_plus_score'] = float(best_alpha.get('alpha_score', best_alpha.get('score', 0.0)))
+    kept['legal_plus_score'] = kept.get('score_legal_minrisk', kept.get('score', 0.0))
+    out = pd.concat([alpha_row.head(1), kept], ignore_index=True, sort=False)
+    out['score'] = out['legal_plus_score']
+    out = out.drop(columns=[col for col in ['_alpha_for_drop', '_consensus_for_drop', '_drop_rank'] if col in out.columns], errors='ignore').reset_index(drop=True)
+    out.attrs['legal_plus_info'] = {**plus_info, 'legal_plus_replaced_stock': dropped_stock}
+    if hasattr(union_candidates, 'attrs') and union_candidates.attrs.get('candidate_debug') is not None:
+        out.attrs['candidate_debug'] = union_candidates.attrs['candidate_debug']
+    return out, branch_cfg
+
+
+def _branch_diag(score_df, candidates, branch_name, score_col='score'):
+    if len(candidates) == 0:
+        return {
+            'branch': branch_name,
+            'available': False,
+            'score_gap': 0.0,
+            'top5_disagreement': 1.0,
+            'top20_overlap': _top_overlap(score_df),
+            'top5_sigma_rank_mean': 1.0,
+            'top5_amp_rank_mean': 1.0,
+            'top5_ret1_rank_mean': 0.0,
+            'top5_ret5_rank_mean': 0.0,
+            'top5_tail_risk_count': 5,
+            'top5_extreme_momo_count': 5,
+            'top5_overheat_count': 5,
+            'top5_reversal_count': 5,
+            'branch_risk_score': 1.0,
+            'defensive_overlap': 0,
+            'risk_screen_ok': False,
+        }
+
+    top = candidates.sort_values(score_col, ascending=False).head(5).copy()
+    rank_cols = [
+        'sigma_rank',
+        'amp_rank',
+        'ret1_rank',
+        'ret5_rank',
+        'liq_rank',
+        'downside_beta60_rank',
+        'max_drawdown20_rank',
+        'tail_risk_flag',
+        'extreme_momo_flag',
+        'overheat_flag',
+        'reversal_flag',
+    ]
+    rank_maps = {col: dict(zip(score_df['stock_id'], score_df[col])) for col in rank_cols if col in score_df.columns}
+
+    def mapped_mean(col, default=0.0):
+        if col in top.columns:
+            return float(pd.to_numeric(top[col], errors='coerce').fillna(default).mean())
+        if col in rank_maps:
+            return float(pd.to_numeric(top['stock_id'].map(rank_maps[col]), errors='coerce').fillna(default).mean())
+        return float(default)
+
+    def mapped_sum(col):
+        if col in top.columns:
+            return int(pd.to_numeric(top[col], errors='coerce').fillna(0).astype(bool).sum())
+        if col in rank_maps:
+            return int(pd.to_numeric(top['stock_id'].map(rank_maps[col]), errors='coerce').fillna(0).astype(bool).sum())
+        return 0
+
+    defensive_overlap = 0
+    if 'score_defensive_v2' in score_df.columns:
+        defensive_top20 = set(score_df.nlargest(min(20, len(score_df)), 'score_defensive_v2')['stock_id'])
+        defensive_overlap = len(set(top['stock_id']) & defensive_top20)
+
+    balanced_top10_overlap = 0
+    conservative_top10_overlap = 0
+    if 'score_balanced' in score_df.columns:
+        balanced_top10 = set(score_df.nlargest(min(10, len(score_df)), 'score_balanced')['stock_id'])
+        balanced_top10_overlap = len(set(top['stock_id']) & balanced_top10)
+    if 'score_conservative_softrisk_v2' in score_df.columns:
+        conservative_top10 = set(score_df.nlargest(min(10, len(score_df)), 'score_conservative_softrisk_v2')['stock_id'])
+        conservative_top10_overlap = len(set(top['stock_id']) & conservative_top10)
+
+    score_gap_5_10 = 0.0
+    if len(candidates) >= 10:
+        sorted_scores = candidates.sort_values(score_col, ascending=False)[score_col].reset_index(drop=True)
+        score_gap_5_10 = float(sorted_scores.iloc[:5].mean() - sorted_scores.iloc[5:10].mean())
+
+    top5_disagreement = float(top.get('rank_disagreement', pd.Series(0.0, index=top.index)).mean())
+    top5_max_sigma_rank = float(pd.to_numeric(top.get('sigma_rank', pd.Series(1.0, index=top.index)), errors='coerce').fillna(1.0).max())
+    top5_max_downside_beta60_rank = float(pd.to_numeric(top.get('downside_beta60_rank', pd.Series(1.0, index=top.index)), errors='coerce').fillna(1.0).max())
+    top5_max_drawdown20_rank = float(pd.to_numeric(top.get('max_drawdown20_rank', pd.Series(1.0, index=top.index)), errors='coerce').fillna(1.0).max())
+    top5_overheat_count = mapped_sum('overheat_flag')
+    top5_reversal_count = mapped_sum('reversal_flag')
+    branch_risk_score = (
+        0.18 * mapped_mean('sigma_rank', default=1.0)
+        + 0.15 * top5_max_sigma_rank
+        + 0.15 * top5_disagreement
+        + 0.15 * top5_max_downside_beta60_rank
+        + 0.15 * top5_max_drawdown20_rank
+        + 0.12 * (top5_overheat_count / 5.0)
+        + 0.10 * (top5_reversal_count / 5.0)
+    )
+
+    return {
+        'branch': branch_name,
+        'available': len(top) >= 5,
+        'score_gap': _score_gap(candidates, score_col=score_col),
+        'score_gap_5_10': score_gap_5_10,
+        'top5_disagreement': top5_disagreement,
+        'top5_max_disagreement': mapped_mean('rank_disagreement', default=1.0) if 'rank_disagreement' not in top.columns else float(pd.to_numeric(top['rank_disagreement'], errors='coerce').fillna(1.0).max()),
+        'top20_overlap': _top_overlap(score_df),
+        'top5_sigma_rank_mean': mapped_mean('sigma_rank', default=1.0),
+        'top5_max_sigma_rank': top5_max_sigma_rank,
+        'top5_amp_rank_mean': mapped_mean('amp_rank', default=1.0),
+        'top5_max_amp_rank': float(pd.to_numeric(top.get('amp_rank', pd.Series(1.0, index=top.index)), errors='coerce').fillna(1.0).max()),
+        'top5_ret1_rank_mean': mapped_mean('ret1_rank', default=0.0),
+        'top5_ret5_rank_mean': mapped_mean('ret5_rank', default=0.0),
+        'top5_min_liq_rank': float(pd.to_numeric(top.get('liq_rank', pd.Series(0.0, index=top.index)), errors='coerce').fillna(0.0).min()),
+        'top5_max_downside_beta60_rank': top5_max_downside_beta60_rank,
+        'top5_max_drawdown20_rank': top5_max_drawdown20_rank,
+        'top5_tail_risk_count': mapped_sum('tail_risk_flag'),
+        'top5_high_vol_count': int(((pd.to_numeric(top.get('sigma_rank', pd.Series(0.0, index=top.index)), errors='coerce').fillna(0.0) > 0.85) | (pd.to_numeric(top.get('amp_rank', pd.Series(0.0, index=top.index)), errors='coerce').fillna(0.0) > 0.85)).sum()),
+        'top5_very_high_vol_count': int(((pd.to_numeric(top.get('sigma_rank', pd.Series(0.0, index=top.index)), errors='coerce').fillna(0.0) > 0.95) | (pd.to_numeric(top.get('amp_rank', pd.Series(0.0, index=top.index)), errors='coerce').fillna(0.0) > 0.95)).sum()),
+        'top5_very_tail_count': int(((pd.to_numeric(top.get('downside_beta60_rank', pd.Series(0.0, index=top.index)), errors='coerce').fillna(0.0) > 0.90) | (pd.to_numeric(top.get('max_drawdown20_rank', pd.Series(0.0, index=top.index)), errors='coerce').fillna(0.0) > 0.90)).sum()),
+        'top5_extreme_momo_count': mapped_sum('extreme_momo_flag'),
+        'top5_overheat_count': top5_overheat_count,
+        'top5_reversal_count': top5_reversal_count,
+        'branch_risk_score': float(branch_risk_score),
+        'defensive_overlap': defensive_overlap,
+        'balanced_top10_overlap': balanced_top10_overlap,
+        'conservative_top10_overlap': conservative_top10_overlap,
+        'risk_screen_ok': True,
+        'top5': ','.join(top['stock_id'].astype(str).tolist()),
+    }
+
+
+def _market_hard_veto(regime, regime_stats):
+    b5 = float(regime_stats.get('breadth_5d', 0.0))
+    m1 = float(regime_stats.get('median_ret1', 0.0))
+    m5 = float(regime_stats.get('median_ret5', 0.0))
+    hvr = float(regime_stats.get('high_vol_ratio', 0.0))
+
+    if regime == 'risk_off':
+        if b5 < 0.45 and m5 < 0.0:
+            return True, 'veto_risk_off_weak_5d'
+        if m1 <= -0.0085 and m5 <= 0.0:
+            return True, 'veto_risk_off_falling_knife'
+
+    if regime == 'mixed_defensive':
+        if b5 >= 0.60 and m5 >= 0.010 and m1 < 0.001:
+            return True, 'veto_mixed_rebound_exhaustion'
+
+    if hvr >= 0.40 and m1 < 0.0 and m5 <= 0.005:
+        return True, 'veto_high_vol_weak_market'
+
+    return False, ''
+
+
+def _market_enable_gate(regime, regime_stats):
+    b1 = float(regime_stats.get('breadth_1d', 0.0))
+    b5 = float(regime_stats.get('breadth_5d', 0.0))
+    m1 = float(regime_stats.get('median_ret1', 0.0))
+    m5 = float(regime_stats.get('median_ret5', 0.0))
+    hvr = float(regime_stats.get('high_vol_ratio', 0.0))
+
+    if (
+        regime == 'risk_on_strict'
+        and b1 >= 0.60
+        and b5 >= 0.60
+        and m1 >= 0.0
+        and m5 >= 0.010
+    ):
+        return True, 'enable_risk_on_trend'
+
+    if (
+        regime == 'risk_off'
+        and b5 >= 0.50
+        and m5 >= 0.0
+        and m1 > -0.008
+        and b1 <= 0.45
+        and hvr <= 0.35
+    ):
+        return True, 'enable_risk_off_rebound'
+
+    if (
+        regime == 'mixed_defensive'
+        and b5 <= 0.35
+        and m5 < 0.0
+        and b1 >= 0.35
+        and m1 > -0.006
+        and hvr <= 0.40
+    ):
+        return True, 'enable_mixed_washout_rebound'
+
+    if (
+        regime == 'neutral_positive'
+        and b5 >= 0.55
+        and m5 >= 0.005
+        and m1 > -0.003
+        and hvr <= 0.35
+    ):
+        return True, 'enable_neutral_quality'
+
+    return False, 'market_not_supported'
+
+
+def _union_selected_rows(candidates):
+    if len(candidates) == 0:
+        return candidates.copy()
+    return candidates.sort_values('score', ascending=False).head(5).copy()
+
+
+def _union_gate_diag(candidates, branch_diag):
+    top = _union_selected_rows(candidates)
+    full_pool = candidates.attrs.get('candidate_pool', candidates) if hasattr(candidates, 'attrs') else candidates
+    if len(top) == 0:
+        out = dict(branch_diag)
+        out.update({
+            'alpha_exception_count': 0,
+            'stable_fill_count': 0,
+            'max_alpha_score_z': 0.0,
+            'selected_branch_count': 0,
+            'avg_consensus_count': 0.0,
+            'top5_branch_only_alpha_count': 5,
+        })
+        return out
+
+    alpha_score = _safe_numeric(top, 'alpha_score')
+    full_alpha = _safe_numeric(full_pool, 'alpha_score')
+    max_alpha_z = float((alpha_score.max() - full_alpha.mean()) / (full_alpha.std(ddof=0) + 1e-9))
+    score_gap = float(branch_diag.get('score_gap', 0.0))
+    score_gap_5_10 = float(branch_diag.get('score_gap_5_10', 0.0))
+    if len(full_pool) >= 10 and 'rerank_score' in full_pool.columns:
+        sorted_scores = pd.to_numeric(full_pool.sort_values('rerank_score', ascending=False)['rerank_score'], errors='coerce').fillna(0.0).reset_index(drop=True)
+        score_gap = float(sorted_scores.iloc[:5].mean() - sorted_scores.iloc[5:min(20, len(sorted_scores))].mean())
+        score_gap_5_10 = float(sorted_scores.iloc[:5].mean() - sorted_scores.iloc[5:10].mean())
+    branch_sources = set()
+    if 'branch_sources' in top.columns:
+        for text in top['branch_sources'].fillna('').astype(str):
+            branch_sources.update([item for item in text.split('|') if item])
+
+    alpha_flags = top.get('alpha_exception', pd.Series(False, index=top.index)).astype(bool)
+    risk_top = top[~alpha_flags].copy()
+    if len(risk_top) == 0:
+        risk_top = top.copy()
+    risk_disagreement = float(pd.to_numeric(risk_top.get('rank_disagreement', pd.Series(0.0, index=risk_top.index)), errors='coerce').fillna(0.0).mean())
+    risk_max_sigma = float(pd.to_numeric(risk_top.get('sigma_rank', pd.Series(0.0, index=risk_top.index)), errors='coerce').fillna(0.0).max())
+    risk_max_downside = float(pd.to_numeric(risk_top.get('downside_beta60_rank', pd.Series(0.0, index=risk_top.index)), errors='coerce').fillna(0.0).max())
+    risk_max_drawdown = float(pd.to_numeric(risk_top.get('max_drawdown20_rank', pd.Series(0.0, index=risk_top.index)), errors='coerce').fillna(0.0).max())
+    risk_overheat_count = int(risk_top.get('overheat_flag', pd.Series(False, index=risk_top.index)).astype(bool).sum())
+    risk_reversal_count = int(risk_top.get('reversal_flag', pd.Series(False, index=risk_top.index)).astype(bool).sum())
+    branch_risk_score = (
+        0.18 * float(pd.to_numeric(risk_top.get('sigma_rank', pd.Series(0.0, index=risk_top.index)), errors='coerce').fillna(0.0).mean())
+        + 0.15 * risk_max_sigma
+        + 0.15 * risk_disagreement
+        + 0.15 * risk_max_downside
+        + 0.15 * risk_max_drawdown
+        + 0.12 * (risk_overheat_count / 5.0)
+        + 0.10 * (risk_reversal_count / 5.0)
+    )
+
+    out = dict(branch_diag)
+    out.update({
+        'alpha_exception_count': int(alpha_flags.sum()),
+        'stable_fill_count': int(top.get('stable_candidate', pd.Series(False, index=top.index)).astype(bool).sum()),
+        'max_alpha_score_z': max_alpha_z,
+        'score_gap': score_gap,
+        'score_gap_5_10': score_gap_5_10,
+        'selected_branch_count': int(len(branch_sources)),
+        'avg_consensus_count': float(pd.to_numeric(top.get('consensus_count', pd.Series(0.0, index=top.index)), errors='coerce').fillna(0.0).mean()),
+        'top5_tail_risk_count': int(risk_top.get('tail_risk_flag', pd.Series(False, index=risk_top.index)).astype(bool).sum()),
+        'top5_high_vol_count': int(risk_top.get('high_vol_flag', pd.Series(False, index=risk_top.index)).astype(bool).sum()),
+        'top5_very_high_vol_count': int(risk_top.get('very_high_vol_flag', pd.Series(False, index=risk_top.index)).astype(bool).sum()),
+        'top5_very_tail_count': int(risk_top.get('very_tail_flag', pd.Series(False, index=risk_top.index)).astype(bool).sum()),
+        'top5_branch_only_alpha_count': int(risk_top.get('branch_only_alpha_flag', pd.Series(False, index=risk_top.index)).astype(bool).sum()),
+        'top5_disagreement': risk_disagreement,
+        'branch_risk_score': float(branch_risk_score),
+    })
+    return out
+
+
+def _alpha_quality_gate(union_diag, regime):
+    alpha_exception_count = int(union_diag.get('alpha_exception_count', 0))
+    stable_fill_count = int(union_diag.get('stable_fill_count', 0))
+    max_alpha_z = float(union_diag.get('max_alpha_score_z', 0.0))
+    score_gap = float(union_diag.get('score_gap', 0.0))
+    score_gap_5_10 = float(union_diag.get('score_gap_5_10', 0.0))
+    selected_branch_count = int(union_diag.get('selected_branch_count', 0))
+    avg_consensus_count = float(union_diag.get('avg_consensus_count', 0.0))
+
+    alpha_strong = max_alpha_z >= 1.50 or score_gap >= 0.080 or score_gap_5_10 >= 0.040
+    consensus_ok = selected_branch_count >= 3 or avg_consensus_count >= 2.0
+
+    if regime == 'risk_off':
+        return (
+            alpha_exception_count >= 2
+            and stable_fill_count >= 2
+            and alpha_strong
+            and consensus_ok
+        )
+    if regime == 'mixed_defensive':
+        return (
+            alpha_exception_count >= 1
+            and stable_fill_count >= 1
+            and alpha_strong
+            and consensus_ok
+        )
+    if regime == 'risk_on_strict':
+        return alpha_exception_count >= 1 and alpha_strong
+    if regime == 'neutral_positive':
+        return (
+            alpha_exception_count >= 1
+            and stable_fill_count >= 1
+            and alpha_strong
+            and consensus_ok
+        )
+    return False
+
+
+def _portfolio_risk_gate(union_diag, regime):
+    tail = int(union_diag.get('top5_tail_risk_count', 5))
+    very_tail = int(union_diag.get('top5_very_tail_count', 5))
+    high_vol = int(union_diag.get('top5_high_vol_count', 5))
+    very_high_vol = int(union_diag.get('top5_very_high_vol_count', 5))
+    branch_only = int(union_diag.get('top5_branch_only_alpha_count', 5))
+    disagreement = float(union_diag.get('top5_disagreement', 1.0))
+    branch_risk_score = float(union_diag.get('branch_risk_score', 1.0))
+
+    if regime == 'risk_off':
+        return (
+            tail <= 2
+            and very_tail <= 1
+            and high_vol <= 2
+            and very_high_vol <= 1
+            and branch_only <= 1
+            and disagreement <= 0.18
+            and branch_risk_score <= 0.72
+        )
+    if regime == 'mixed_defensive':
+        return (
+            tail <= 2
+            and very_tail <= 1
+            and high_vol <= 2
+            and very_high_vol <= 1
+            and branch_only <= 1
+            and disagreement <= 0.12
+            and branch_risk_score <= 0.75
+        )
+    if regime == 'risk_on_strict':
+        return (
+            tail <= 3
+            and very_tail <= 1
+            and very_high_vol <= 2
+            and branch_only <= 2
+            and branch_risk_score <= 0.82
+        )
+    if regime == 'neutral_positive':
+        return (
+            tail <= 2
+            and very_tail <= 1
+            and high_vol <= 2
+            and very_high_vol <= 1
+            and branch_risk_score <= 0.75
+        )
+    return False
+
+
+def _fallback_branch_for_gate(selector_cfg, regime, reason):
+    gate_cfg = selector_cfg.get('gated_union_rerank', {})
+    if regime == 'risk_off' and reason in {'veto_risk_off_weak_5d', 'veto_risk_off_falling_knife'}:
+        return gate_cfg.get('secondary_fallback_branch', 'defensive_v2_strict')
+    if regime == 'risk_on_strict' and reason == 'alpha_quality_failed_risk_on':
+        return gate_cfg.get('secondary_fallback_branch', 'defensive_v2_strict')
+    return gate_cfg.get('default_fallback_branch', 'legal_minrisk_hardened')
+
+
+def _evaluate_gated_union(union_candidates, union_diag, regime, regime_stats, selector_cfg):
+    gate_cfg = selector_cfg.get('gated_union_rerank', {})
+    if not gate_cfg.get('enabled', False):
+        return True, 'gate_disabled', 'independent_union_rerank', {}
+
+    veto, veto_reason = _market_hard_veto(regime, regime_stats)
+    gate_debug = {
+        'market_veto': bool(veto),
+        'market_veto_reason': veto_reason,
+    }
+    if veto:
+        fallback = _fallback_branch_for_gate(selector_cfg, regime, veto_reason)
+        gate_debug.update({
+            'market_enable': False,
+            'market_enable_reason': veto_reason,
+            'alpha_quality_ok': False,
+            'portfolio_risk_ok': False,
+            'chosen_after_gate': fallback,
+            'fallback_reason': veto_reason,
+        })
+        return False, veto_reason, fallback, gate_debug
+
+    market_ok, market_reason = _market_enable_gate(regime, regime_stats)
+    gate_debug.update({
+        'market_enable': bool(market_ok),
+        'market_enable_reason': market_reason,
+    })
+    if not market_ok:
+        fallback = _fallback_branch_for_gate(selector_cfg, regime, market_reason)
+        gate_debug.update({
+            'alpha_quality_ok': False,
+            'portfolio_risk_ok': False,
+            'chosen_after_gate': fallback,
+            'fallback_reason': market_reason,
+        })
+        return False, market_reason, fallback, gate_debug
+
+    gate_diag = _union_gate_diag(union_candidates, union_diag)
+    alpha_ok = _alpha_quality_gate(gate_diag, regime)
+    gate_debug.update({
+        'alpha_quality_ok': bool(alpha_ok),
+        'alpha_exception_count': gate_diag.get('alpha_exception_count', 0),
+        'stable_fill_count': gate_diag.get('stable_fill_count', 0),
+        'max_alpha_score_z': gate_diag.get('max_alpha_score_z', 0.0),
+        'selected_branch_count': gate_diag.get('selected_branch_count', 0),
+        'avg_consensus_count': gate_diag.get('avg_consensus_count', 0.0),
+    })
+    if not alpha_ok:
+        reason = 'alpha_quality_failed_risk_on' if regime == 'risk_on_strict' else 'alpha_quality_failed'
+        fallback = _fallback_branch_for_gate(selector_cfg, regime, reason)
+        gate_debug.update({
+            'portfolio_risk_ok': False,
+            'chosen_after_gate': fallback,
+            'fallback_reason': reason,
+        })
+        return False, reason, fallback, gate_debug
+
+    risk_ok = _portfolio_risk_gate(gate_diag, regime)
+    gate_debug.update({
+        'portfolio_risk_ok': bool(risk_ok),
+        'top5_tail_risk_count': gate_diag.get('top5_tail_risk_count', 0),
+        'top5_very_tail_count': gate_diag.get('top5_very_tail_count', 0),
+        'top5_high_vol_count': gate_diag.get('top5_high_vol_count', 0),
+        'top5_very_high_vol_count': gate_diag.get('top5_very_high_vol_count', 0),
+        'top5_branch_only_alpha_count': gate_diag.get('top5_branch_only_alpha_count', 0),
+        'top5_disagreement': gate_diag.get('top5_disagreement', 0.0),
+        'branch_risk_score': gate_diag.get('branch_risk_score', 0.0),
+    })
+    if not risk_ok:
+        fallback = _fallback_branch_for_gate(selector_cfg, regime, 'portfolio_risk_budget_failed')
+        gate_debug.update({
+            'chosen_after_gate': fallback,
+            'fallback_reason': 'portfolio_risk_budget_failed',
+        })
+        return False, 'portfolio_risk_budget_failed', fallback, gate_debug
+
+    gate_debug.update({
+        'chosen_after_gate': 'independent_union_rerank',
+        'fallback_reason': '',
+    })
+    return True, market_reason, 'independent_union_rerank', gate_debug
+
+
+def _diag_passes(diag, regime, regime_stats, selector_cfg, branch_name):
+    if not diag['available']:
+        return False
+
+    if branch_name == 'independent_union_rerank':
+        return True
+
+    if branch_name == 'legal_plus_1alpha':
+        return True
+
+    if branch_name in {'legal_minrisk', 'legal_minrisk_hardened'}:
+        if branch_name == 'legal_minrisk_hardened' and regime == 'risk_off':
+            market_5d_weak = float(regime_stats.get('median_ret5', 0.0)) < 0.0
+            market_1d_toxic = float(regime_stats.get('median_ret1', 0.0)) <= -0.010
+            legal_risk = float(diag.get('branch_risk_score', 0.0))
+            if (market_5d_weak and legal_risk >= 0.30) or (market_1d_toxic and legal_risk >= 0.18):
+                return False
+        return True
+
+    budget_cfg = selector_cfg.get('branch_risk_budget', {})
+    risk_budget_ok = (
+        not budget_cfg.get('enabled', False)
+        or float(diag.get('branch_risk_score', 1.0)) <= float(budget_cfg.get(regime, 1.0))
+    )
+
+    if branch_name in {'lgb_only', 'lgb_only_guarded'}:
+        return (
+            regime == 'risk_on_strict'
+            and risk_budget_ok
+            and regime_stats.get('breadth_1d', 0.0) >= 0.62
+            and regime_stats.get('breadth_5d', 0.0) >= 0.58
+            and regime_stats.get('median_ret1', 0.0) > 0.0
+            and regime_stats.get('median_ret5', 0.0) > 0.008
+            and diag['top5_tail_risk_count'] == 0
+            and diag['top5_reversal_count'] == 0
+            and diag['top5_high_vol_count'] <= 1
+            and diag['top5_very_high_vol_count'] == 0
+            and diag['top5_disagreement'] <= 0.18
+            and diag['top5_max_disagreement'] <= 0.28
+            and diag['top5_min_liq_rank'] >= 0.15
+            and diag['top5_max_downside_beta60_rank'] <= 0.80
+            and diag['top5_max_drawdown20_rank'] <= 0.80
+            and max(diag['balanced_top10_overlap'], diag['conservative_top10_overlap']) >= 3
+            and diag['score_gap_5_10'] >= 0.04
+        )
+
+    if branch_name in {'conservative_blend', 'conservative_softrisk', 'conservative_softrisk_v2', 'conservative_softrisk_v2_strict'}:
+        strict = branch_name == 'conservative_softrisk_v2_strict'
+        if regime == 'risk_off':
+            return (
+                not strict
+                and regime_stats.get('breadth_5d', 0.0) >= 0.50
+                and regime_stats.get('median_ret5', 0.0) >= 0.0
+                and float(diag.get('branch_risk_score', 1.0)) <= 0.70
+                and diag['top5_tail_risk_count'] <= 4
+                and diag['top5_reversal_count'] <= 1
+                and diag['top5_disagreement'] <= 0.08
+                and diag['top5_min_liq_rank'] >= 0.10
+            )
+        if regime == 'mixed_defensive':
+            return (
+                strict
+                and risk_budget_ok
+                and diag['top5_tail_risk_count'] == 0
+                and diag['top5_reversal_count'] == 0
+                and diag['top5_disagreement'] <= 0.16
+                and diag['top5_max_disagreement'] <= 0.24
+                and diag['top5_max_sigma_rank'] <= 0.80
+                and diag['top5_max_downside_beta60_rank'] <= 0.78
+                and diag['top5_max_drawdown20_rank'] <= 0.78
+                and diag['top5_min_liq_rank'] >= 0.15
+            )
+        if regime == 'neutral_positive':
+            return (
+                strict
+                and risk_budget_ok
+                and diag['top5_tail_risk_count'] <= 1
+                and diag['top5_reversal_count'] <= 1
+                and diag['top5_disagreement'] <= 0.20
+                and diag['top5_max_disagreement'] <= 0.30
+                and diag['top5_min_liq_rank'] >= 0.10
+            )
+        return (
+            strict
+            and risk_budget_ok
+            and diag['top5_tail_risk_count'] <= 1
+            and diag['top5_reversal_count'] <= 1
+            and diag['top5_disagreement'] <= 0.20
+            and diag['top5_max_disagreement'] <= 0.30
+            and diag['top5_min_liq_rank'] >= 0.10
+        )
+
+    if branch_name in {'balanced_blend', 'balanced_guarded'}:
+        if regime not in {'risk_on_strict', 'neutral_positive'}:
+            return False
+        base_ok = (
+            risk_budget_ok
+            and diag['top5_tail_risk_count'] <= 1
+            and diag['top5_reversal_count'] <= 1
+            and diag['top5_very_tail_count'] == 0
+            and diag['top5_disagreement'] <= 0.22
+            and diag['top5_max_disagreement'] <= 0.32
+            and diag['top5_min_liq_rank'] >= 0.12
+            and diag['top5_max_downside_beta60_rank'] <= 0.85
+            and diag['top5_max_drawdown20_rank'] <= 0.85
+        )
+        if regime == 'neutral_positive':
+            base_ok = base_ok and (
+                diag['top5_tail_risk_count'] == 0
+                or diag['top5_max_disagreement'] <= 0.25
+            )
+        return base_ok
+
+    if branch_name in {'stable_top30_rerank_trend'}:
+        return (
+            regime in {'risk_on_strict', 'neutral_positive'}
+            and diag['top5_tail_risk_count'] <= 3
+            and diag['top5_reversal_count'] <= 2
+        )
+
+    if branch_name in {'defensive_v2', 'defensive_branch', 'defensive_v2_strict'}:
+        return (
+            regime in {'risk_off', 'mixed_defensive'}
+            and diag['score_gap'] >= 0.06
+            and diag['top5_tail_risk_count'] <= 1
+            and diag['top5_disagreement'] <= (0.80 if regime == 'risk_off' else 0.70)
+        )
+
+    return False
+
+
+META_GATE_NUMERIC_FEATURES = [
+    'score_gap',
+    'score_gap_5_10',
+    'top20_overlap',
+    'top5_disagreement',
+    'top5_max_disagreement',
+    'top5_sigma_rank_mean',
+    'top5_max_sigma_rank',
+    'top5_amp_rank_mean',
+    'top5_max_amp_rank',
+    'top5_ret1_rank_mean',
+    'top5_ret5_rank_mean',
+    'top5_min_liq_rank',
+    'top5_max_downside_beta60_rank',
+    'top5_max_drawdown20_rank',
+    'top5_tail_risk_count',
+    'top5_high_vol_count',
+    'top5_very_high_vol_count',
+    'top5_very_tail_count',
+    'top5_extreme_momo_count',
+    'top5_overheat_count',
+    'top5_reversal_count',
+    'branch_risk_score',
+    'defensive_overlap',
+    'balanced_top10_overlap',
+    'conservative_top10_overlap',
+    'breadth_1d',
+    'breadth_5d',
+    'median_ret1',
+    'median_ret5',
+    'high_vol_ratio',
+]
+
+
+def _load_meta_gate(selector_cfg):
+    gate_cfg = selector_cfg.get('meta_gate', {})
+    if not gate_cfg.get('enabled', False):
+        return None
+
+    artifact_path = gate_cfg.get('artifact_path')
+    if not artifact_path:
+        artifact_path = os.path.join(config['output_dir'], 'branch_meta_gate.pkl')
+    if not os.path.exists(artifact_path):
+        print(f'[BDC][selector] meta_gate_missing={artifact_path}')
+        return None
+
+    try:
+        artifact = joblib.load(artifact_path)
+        artifact['artifact_path'] = artifact_path
+        return artifact
+    except Exception as exc:
+        print(f'[BDC][selector] meta_gate_load_failed={artifact_path}: {exc}')
+        return None
+
+
+def _build_meta_gate_features(rows, artifact):
+    raw = pd.DataFrame(rows).copy()
+    features = pd.DataFrame(index=raw.index)
+    for col in META_GATE_NUMERIC_FEATURES:
+        if col in raw.columns:
+            features[col] = pd.to_numeric(raw[col], errors='coerce').fillna(0.0)
+        else:
+            features[col] = 0.0
+
+    for branch in artifact.get('branches', []):
+        features[f'branch={branch}'] = (raw.get('branch', '') == branch).astype(float)
+    for regime in artifact.get('regimes', []):
+        features[f'regime={regime}'] = (raw.get('regime', '') == regime).astype(float)
+
+    feature_columns = artifact.get('feature_columns', list(features.columns))
+    for col in feature_columns:
+        if col not in features.columns:
+            features[col] = 0.0
+    return features[feature_columns].astype(np.float64)
+
+
+def _score_meta_gate(rows, artifact, selector_cfg, fallback_branch):
+    if artifact is None or not rows:
+        return []
+
+    X = _build_meta_gate_features(rows, artifact)
+    safe_model = artifact.get('safe_model')
+    score_model = artifact.get('score_model')
+    if safe_model is None or score_model is None:
+        return []
+
+    if hasattr(safe_model, 'predict_proba'):
+        proba = safe_model.predict_proba(X)
+        safe_prob = proba[:, 1] if proba.shape[1] > 1 else proba[:, 0]
+    else:
+        safe_prob = np.asarray(safe_model.predict(X), dtype=np.float64)
+    pred_score = np.asarray(score_model.predict(X), dtype=np.float64)
+
+    gate_cfg = selector_cfg.get('meta_gate', {})
+    safe_threshold = float(gate_cfg.get('safe_threshold', 0.70))
+    unsafe_penalty = float(gate_cfg.get('unsafe_penalty', 0.02))
+    risk_penalty = float(gate_cfg.get('risk_penalty', 0.0))
+    require_rule_pass = bool(gate_cfg.get('require_rule_pass', False))
+
+    scored = []
+    for row, p_safe, p_score in zip(rows, safe_prob, pred_score):
+        branch_name = row.get('branch')
+        gate_allowed = float(p_safe) >= safe_threshold
+        if require_rule_pass:
+            gate_allowed = gate_allowed and bool(row.get('rule_passes', False))
+        if branch_name == fallback_branch:
+            gate_allowed = True
+
+        utility = (
+            float(p_score)
+            - unsafe_penalty * (1.0 - float(p_safe))
+            - risk_penalty * float(row.get('branch_risk_score', 0.0))
+        )
+        scored.append({
+            'branch': branch_name,
+            'meta_safe_prob': float(p_safe),
+            'meta_pred_score': float(p_score),
+            'meta_utility': float(utility),
+            'meta_allowed': bool(gate_allowed),
+        })
+    return scored
+
+
+def choose_selector_branch(score_df, selector_cfg):
+    regime, regime_stats = infer_regime(score_df)
+    forced = selector_cfg.get('force_branch')
+    fallback_branch = selector_cfg.get('fallback_branch', 'legal_minrisk')
+    branch_order = selector_cfg.get('regime_branch_order', {}).get(regime, ['lgb_only_guarded', fallback_branch])
+    if forced:
+        branch_order = [forced]
+    elif fallback_branch not in branch_order:
+        branch_order = list(branch_order) + [fallback_branch]
+
+    diagnostics = []
+    chosen_name = None
+    chosen_candidates = None
+    chosen_cfg = {}
+    branch_payloads = {}
+    gate_debug_rows = []
+
+    for branch_name in branch_order:
+        candidates, branch_cfg = _branch_candidates(score_df, selector_cfg, branch_name, regime=regime)
+        diag = _branch_diag(score_df, candidates, branch_name)
+        diag['filter'] = branch_cfg.get('filter', 'unavailable')
+        diag['score_col'] = branch_cfg.get('score_col', 'unavailable')
+        diag.update(regime_stats)
+        diag['regime'] = regime
+        if hasattr(candidates, 'attrs') and candidates.attrs.get('legal_plus_info'):
+            diag.update(candidates.attrs.get('legal_plus_info', {}))
+        diag['rule_passes'] = _diag_passes(diag, regime, regime_stats, selector_cfg, branch_name)
+        diag['passes'] = diag['rule_passes']
+
+        if branch_name == 'independent_union_rerank' and diag['rule_passes']:
+            gate_ok, gate_reason, gate_branch, gate_debug = _evaluate_gated_union(
+                candidates,
+                diag,
+                regime,
+                regime_stats,
+                selector_cfg,
+            )
+            diag.update(gate_debug)
+            diag['gate_reason'] = gate_reason
+            diag['passes'] = bool(gate_ok)
+            diag['rule_passes'] = bool(gate_ok)
+            gate_debug_row = dict(gate_debug)
+            gate_debug_row.update(regime_stats)
+            gate_debug_row['regime'] = regime
+            gate_debug_row['branch'] = branch_name
+            gate_debug_row['final_picks'] = diag.get('top5', '')
+            gate_debug_rows.append(gate_debug_row)
+            if not gate_ok and gate_branch not in branch_order:
+                branch_order = list(branch_order) + [gate_branch]
+
+        diagnostics.append(diag)
+        branch_payloads[branch_name] = (candidates, branch_cfg)
+
+        if diag['passes'] and chosen_name is None:
+            chosen_name = branch_name
+            chosen_candidates = candidates
+            chosen_cfg = branch_cfg
+            if forced:
+                break
+
+    gate_artifact = None if forced else _load_meta_gate(selector_cfg)
+    gate_scores = _score_meta_gate(diagnostics, gate_artifact, selector_cfg, fallback_branch)
+    if gate_scores:
+        gate_by_branch = {row['branch']: row for row in gate_scores}
+        for diag in diagnostics:
+            gate_row = gate_by_branch.get(diag['branch'])
+            if gate_row:
+                diag.update(gate_row)
+                diag['passes'] = bool(gate_row['meta_allowed'])
+
+        allowed = [
+            diag for diag in diagnostics
+            if diag.get('available', False) and diag.get('meta_allowed', False)
+        ]
+        if allowed:
+            best = max(allowed, key=lambda row: row.get('meta_utility', -np.inf))
+            chosen_name = best['branch']
+            chosen_candidates, chosen_cfg = branch_payloads.get(chosen_name, (None, {}))
+
+    if chosen_candidates is None or len(chosen_candidates) < 5:
+        chosen_candidates, chosen_cfg = _branch_candidates(score_df, selector_cfg, fallback_branch, regime=regime)
+        chosen_name = fallback_branch
+        if chosen_candidates is None or len(chosen_candidates) < 5:
+            emergency = selector_cfg.get('emergency_fallback_branch', 'legal_minrisk_hardened')
+            chosen_candidates, chosen_cfg = _branch_candidates(score_df, selector_cfg, emergency, regime=regime)
+            chosen_name = emergency
+        diag = _branch_diag(score_df, chosen_candidates, chosen_name)
+        diag['filter'] = chosen_cfg.get('filter', 'legal_minrisk_hardened')
+        diag['score_col'] = chosen_cfg.get('score_col', 'score_legal_minrisk')
+        diag['passes'] = len(chosen_candidates) >= 5
+        diagnostics.append(diag)
+
+    selector_info = {
+        'selector_version': selector_cfg.get('version', 'unknown'),
+        'regime': regime,
+        'regime_stats': regime_stats,
+        'chosen_branch': chosen_name,
+        'diagnostics': diagnostics,
+        'exposure_cap': float(chosen_cfg.get('exposure', 1.0)),
+        'meta_gate_enabled': gate_artifact is not None,
+        'meta_gate_artifact': gate_artifact.get('artifact_path') if gate_artifact else None,
+        'gate_debug': gate_debug_rows,
+    }
+    candidate_debug = chosen_candidates.attrs.get('candidate_debug') if hasattr(chosen_candidates, 'attrs') else None
+    if candidate_debug is not None:
+        selector_info['candidate_debug'] = candidate_debug.to_dict('records')
+    return chosen_candidates, selector_info
+
+
 def _resolve_device():
     if torch.cuda.is_available():
         return torch.device('cuda')
@@ -356,12 +1930,14 @@ def _get_autocast_context(device):
 
 
 def main():
-    data_file = os.path.join(config['data_path'], 'train.csv')
+    data_file = os.environ.get('BDC_DATA_FILE', os.path.join(config['data_path'], 'train.csv'))
     model_dir = _resolve_model_dir()
     model_path = os.path.join(model_dir, 'best_model.pth')
     scaler_path = os.path.join(model_dir, 'scaler.pkl')
-    output_path = os.path.join('./output/', 'result.csv')
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_path = os.environ.get('BDC_OUTPUT_PATH', os.path.join('./output/', 'result.csv'))
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f'未找到模型文件: {model_path}')
@@ -410,20 +1986,31 @@ def main():
     inference_df = artifacts['inference_df']
     lgb_bundle = load_lgb_branches(model_dir)
     lgb_scores = predict_lgb_score(lgb_bundle, inference_df, config)
+    blend_cfg = config.get('blend', {})
+    score_mode = blend_cfg.get('score_mode', 'blend')
+    norm_mode = blend_cfg.get('normalize', 'zscore')
     if lgb_scores is None:
         scores = transformer_scores
         score_source = 'transformer'
+    elif score_mode in ('lgb', 'lgb_only'):
+        scores = np.asarray(lgb_scores, dtype=np.float64)
+        score_source = 'lgb_only'
+    elif score_mode in ('transformer', 'transformer_only'):
+        scores = np.asarray(transformer_scores, dtype=np.float64)
+        score_source = 'transformer_only'
+    elif score_mode == 'selector':
+        scores = np.asarray(lgb_scores, dtype=np.float64)
+        score_source = 'selector_pending'
     else:
-        blend_cfg = config.get('blend', {})
         t_w = blend_cfg.get('transformer_weight', 0.55)
         lgb_w = blend_cfg.get('lgb_weight', 0.45)
-        transformer_z = zscore(transformer_scores)
-        lgb_z = zscore(lgb_scores)
+        transformer_z = normalize_score(transformer_scores, norm_mode)
+        lgb_z = normalize_score(lgb_scores, norm_mode)
         scores = t_w * transformer_z + lgb_w * lgb_z
         agreement_penalty = blend_cfg.get('agreement_penalty', 0.0)
         if agreement_penalty > 0:
             scores = scores - agreement_penalty * np.abs(transformer_z - lgb_z)
-        score_source = f'transformer+lgb({t_w:.2f}/{lgb_w:.2f}, penalty={agreement_penalty:.2f})'
+        score_source = f'transformer+lgb({t_w:.2f}/{lgb_w:.2f}, norm={norm_mode}, penalty={agreement_penalty:.2f})'
 
     score_df = pd.DataFrame({
         'stock_id': sequence_stock_ids,
@@ -434,27 +2021,78 @@ def main():
     score_df = score_df.merge(artifacts['risk_df'], on='stock_id', how='left')
     score_df['sigma20'] = score_df['sigma20'].fillna(score_df['sigma20'].median()).clip(lower=1e-4)
     score_df['median_amount20'] = score_df['median_amount20'].fillna(0.0)
-    for col in ['ret5', 'ret20', 'amp20']:
+    for col in [
+        'ret1',
+        'ret5',
+        'ret20',
+        'amp20',
+        'amount20',
+        'return_1',
+        'return_5',
+        'beta60',
+        'downside_beta60',
+        'idio_vol60',
+        'max_drawdown20',
+    ]:
         score_df[col] = score_df[col].fillna(score_df[col].median() if score_df[col].notna().any() else 0.0)
 
-    filtered = select_candidates(score_df)
+    post_cfg = config.get('postprocess', {})
+    selector_cfg = config.get('selector', {})
+    selector_info = None
+    if selector_cfg.get('enabled', False) and score_mode == 'selector' and lgb_scores is not None:
+        score_df = add_selector_scores(score_df)
+        filtered, selector_info = choose_selector_branch(score_df, selector_cfg)
+        chosen_branch = selector_info['chosen_branch']
+        branch_cfg = selector_cfg.get('branches', {}).get(chosen_branch, {})
+        chosen_score_col = branch_cfg.get('score_col')
+        if chosen_score_col in score_df.columns:
+            score_df['score'] = score_df[chosen_score_col]
+        exposure_cap = selector_info['exposure_cap']
+        score_source = f'selector:{chosen_branch}, regime={selector_info["regime"]}'
+    else:
+        filtered = select_candidates(score_df, post_cfg)
+        breadth = artifacts['breadth']
+        if 'exposure_cap' in post_cfg:
+            exposure_cap = float(post_cfg['exposure_cap'])
+        else:
+            exposure_cap = 0.7 if breadth < 0.30 else 1.0
+
     if len(filtered) < 5:
         raise ValueError(f'可预测股票不足5只，当前仅有 {len(filtered)} 只')
 
-    breadth = artifacts['breadth']
-    exposure_cap = 0.7 if breadth < 0.30 else 1.0
-    post_cfg = config.get('postprocess', {})
     weighting_name = post_cfg.get('weighting', 'equal')
     output_df = build_weight_portfolio(filtered, weighting_name, exposure_cap=exposure_cap)
     output_df.to_csv(output_path, index=False)
-    score_df.sort_values('score', ascending=False).to_csv('./temp/predict_score_df.csv', index=False)
-    filtered.head(30).to_csv('./temp/predict_filtered_top30.csv', index=False)
+    score_df_path = os.environ.get('BDC_SCORE_DF_PATH', './temp/predict_score_df.csv')
+    filtered_path = os.environ.get('BDC_FILTERED_DF_PATH', './temp/predict_filtered_top30.csv')
+    selector_json_path = os.environ.get('BDC_SELECTOR_JSON_PATH', './temp/selector_diagnostics.json')
+    selector_csv_path = os.environ.get('BDC_SELECTOR_CSV_PATH', './temp/selector_diagnostics.csv')
+    selector_debug_path = os.environ.get('BDC_SELECTOR_DEBUG_PATH', './temp/selector_candidates_debug.csv')
+    gated_debug_path = os.environ.get('BDC_GATED_SELECTOR_DEBUG_PATH', './temp/gated_selector_debug.csv')
+    for path in [score_df_path, filtered_path, selector_json_path, selector_csv_path, selector_debug_path, gated_debug_path]:
+        path_dir = os.path.dirname(path)
+        if path_dir:
+            os.makedirs(path_dir, exist_ok=True)
+
+    score_df.sort_values('score', ascending=False).to_csv(score_df_path, index=False)
+    filtered.head(30).to_csv(filtered_path, index=False)
+    if selector_info is not None:
+        with open(selector_json_path, 'w', encoding='utf-8') as f:
+            json.dump(selector_info, f, ensure_ascii=False, indent=2, default=str)
+        pd.DataFrame(selector_info['diagnostics']).to_csv(selector_csv_path, index=False)
+        if selector_info.get('candidate_debug'):
+            pd.DataFrame(selector_info['candidate_debug']).to_csv(selector_debug_path, index=False)
+        if selector_info.get('gate_debug'):
+            pd.DataFrame(selector_info['gate_debug']).to_csv(gated_debug_path, index=False)
 
     print(f'[BDC][predict] date={latest_date.date()}')
     print(f'[BDC][predict] ranked_stocks={len(score_df)}')
     print(f'[BDC][predict] score_source={score_source}')
     print(f'[BDC][predict] amp={amp_enabled}')
     print(f'[BDC][predict] postprocess=filter:{post_cfg.get("filter", "stable")}, weighting:{post_cfg.get("weighting", "equal")}')
+    if selector_info is not None:
+        print(f'[BDC][selector] regime={selector_info["regime"]}, stats={selector_info["regime_stats"]}')
+        print(f'[BDC][selector] chosen_branch={selector_info["chosen_branch"]}')
     print(f'[BDC][predict] exposure={output_df["weight"].sum():.4f}')
     print(f'[BDC][predict] output={output_path}')
 

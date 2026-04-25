@@ -21,17 +21,19 @@
     "train_lgb": true,
     "blend": {
         "transformer_weight": 0.3,
-        "lgb_weight": 0.7
+        "lgb_weight": 0.7,
+        "agreement_penalty": 0.0
     },
     "postprocess": {
-        "filter": "stable",
+        "filter": "regime_liquidity_risk_off",
         "weighting": "equal",
-        "liquidity_quantile": 0.2,
+        "liquidity_quantile": 0.1,
         "sigma_quantile": 0.85
     },
     "lgb": {
         "rank_weight": 0.65,
         "reg_weight": 0.35,
+        "top5_rank_weight": 0.0,
         "label_clip": 0.2,
         "rank_learning_rate": 0.03,
         "reg_learning_rate": 0.03,
@@ -45,6 +47,24 @@
         "early_stopping_rounds": 100,
         "log_period": 100,
         "n_jobs": 8
+    },
+    "lgb_top5": {
+        "train": false,
+        "blend_weight": 0.0,
+        "top1_gain": null,
+        "top5_gain": 10,
+        "top10_gain": 4,
+        "top20_gain": 1,
+        "negative_cap": 1,
+        "learning_rate": 0.03,
+        "n_estimators": 1500,
+        "num_leaves": 31,
+        "min_child_samples": 64,
+        "subsample": 0.8,
+        "colsample_bytree": 0.7,
+        "reg_lambda": 5.0,
+        "early_stopping_rounds": 100,
+        "log_period": 100
     },
     "lgb_search": {
         "num_leaves": [

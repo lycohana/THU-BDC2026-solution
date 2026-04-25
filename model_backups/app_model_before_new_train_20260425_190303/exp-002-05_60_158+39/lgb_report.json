@@ -1,0 +1,14 @@
+{
+  "rank_best_iteration": 401,
+  "reg_best_iteration": 8,
+  "valid_final_score": 0.266464143406249,
+  "num_features": 270,
+  "num_train_rows": 143690,
+  "num_valid_rows": 27000,
+  "search_best_params": {
+    "num_leaves": 127,
+    "min_child_samples": 32,
+    "learning_rate": 0.05
+  },
+  "search_best_score": 0.266464143406249
+}
