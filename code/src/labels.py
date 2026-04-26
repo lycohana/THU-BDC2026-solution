@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 
 def normalize_stock_id(value):
@@ -39,21 +40,140 @@ def add_label_o2o_week(
 
     open_base = out[[stock_col, '_date_idx', open_col]].copy()
 
-    open_t1 = open_base.rename(columns={open_col: 'open_t1'})
+    entry_col = 'open_entry_t1'
+    exit_col = f'open_exit_t{horizon}'
+
+    open_t1 = open_base.rename(columns={open_col: entry_col})
     open_t1['_date_idx'] -= 1
 
-    open_tn = open_base.rename(columns={open_col: f'open_t{horizon}'})
+    open_tn = open_base.rename(columns={open_col: exit_col})
     open_tn['_date_idx'] -= horizon
 
-    out = out.merge(open_t1[[stock_col, '_date_idx', 'open_t1']], on=[stock_col, '_date_idx'], how='left')
-    out = out.merge(open_tn[[stock_col, '_date_idx', f'open_t{horizon}']], on=[stock_col, '_date_idx'], how='left')
+    out = out.merge(open_t1[[stock_col, '_date_idx', entry_col]], on=[stock_col, '_date_idx'], how='left')
+    out = out.merge(open_tn[[stock_col, '_date_idx', exit_col]], on=[stock_col, '_date_idx'], how='left')
 
     out[label_col] = (
-        pd.to_numeric(out[f'open_t{horizon}'], errors='coerce')
-        / (pd.to_numeric(out['open_t1'], errors='coerce') + 1e-12)
+        pd.to_numeric(out[exit_col], errors='coerce')
+        / (pd.to_numeric(out[entry_col], errors='coerce') + 1e-12)
         - 1.0
     )
-    return out.drop(columns=['_date_idx', 'open_t1', f'open_t{horizon}'])
+    return out.drop(columns=['_date_idx', entry_col, exit_col])
+
+
+def build_quality_label(
+    df,
+    raw_label_col='label',
+    output_col='quality5',
+    stock_col='股票代码',
+    date_col='日期',
+    high_col='最高',
+    low_col='最低',
+    close_col='收盘',
+    tradable_col=None,
+    fee=0.0,
+    slippage=0.0,
+    lambda_vol=0.0,
+    lambda_dd=0.0,
+    horizon=5,
+):
+    """Build a Top5-oriented trading-quality label from scorer-aligned return.
+
+    quality = tradable * (raw_return - fee - slippage)
+              - lambda_vol * future_realized_vol
+              - lambda_dd * future_path_drawdown
+    """
+    out = df.copy()
+    out[stock_col] = out[stock_col].map(normalize_stock_id)
+    out[date_col] = pd.to_datetime(out[date_col])
+    out = out.sort_values([stock_col, date_col]).reset_index(drop=True)
+
+    if raw_label_col not in out.columns:
+        out = add_label_o2o_week(
+            out,
+            horizon=horizon,
+            stock_col=stock_col,
+            date_col=date_col,
+            open_col='开盘',
+            label_col=raw_label_col,
+        )
+
+    for col in [high_col, low_col, close_col, raw_label_col]:
+        out[col] = pd.to_numeric(out[col], errors='coerce')
+
+    grouped = out.groupby(stock_col, sort=False)
+    future_returns = []
+    future_drawdowns = []
+    for step in range(1, horizon + 1):
+        future_close = grouped[close_col].shift(-step)
+        future_ret = future_close / (out[close_col] + 1e-12) - 1.0
+        future_returns.append(future_ret)
+
+        future_low = grouped[low_col].shift(-step)
+        entry_close = grouped[close_col].shift(-1)
+        future_drawdowns.append((future_low / (entry_close + 1e-12) - 1.0).clip(upper=0.0).abs())
+
+    if future_returns:
+        ret_frame = pd.concat(future_returns, axis=1)
+        dd_frame = pd.concat(future_drawdowns, axis=1)
+        out[f'{output_col}_realized_vol'] = ret_frame.std(axis=1).fillna(0.0)
+        out[f'{output_col}_path_drawdown'] = dd_frame.max(axis=1).fillna(0.0)
+    else:
+        out[f'{output_col}_realized_vol'] = 0.0
+        out[f'{output_col}_path_drawdown'] = 0.0
+
+    tradable = 1.0
+    if tradable_col and tradable_col in out.columns:
+        tradable = pd.to_numeric(out[tradable_col], errors='coerce').fillna(0.0).clip(0.0, 1.0)
+
+    out[output_col] = (
+        tradable * (out[raw_label_col] - float(fee) - float(slippage))
+        - float(lambda_vol) * out[f'{output_col}_realized_vol']
+        - float(lambda_dd) * out[f'{output_col}_path_drawdown']
+    )
+    return out
+
+
+def build_relevance_bins(
+    df,
+    quality_col='quality5',
+    output_col='relevance5',
+    date_col='日期',
+    n_bins=5,
+):
+    """Map same-day cross-sectional quality into integer relevance bins."""
+    if n_bins < 2:
+        raise ValueError('n_bins must be at least 2')
+
+    out = df.copy()
+    quality = pd.to_numeric(out[quality_col], errors='coerce')
+    pct = quality.groupby(out[date_col]).rank(method='first', pct=True, ascending=True)
+    relevance = np.floor(pct.to_numpy(dtype=np.float64) * int(n_bins)).astype(float)
+    relevance = np.clip(relevance, 0, int(n_bins) - 1)
+    relevance[pct.isna().to_numpy()] = np.nan
+    out[output_col] = pd.Series(relevance, index=out.index).astype('Int64')
+    return out
+
+
+def build_aux_horizon_labels(
+    df,
+    horizons=(1, 3),
+    stock_col='股票代码',
+    date_col='日期',
+    open_col='开盘',
+    prefix='aux',
+):
+    """Add scorer-style auxiliary open-to-open labels for shorter horizons."""
+    out = df.copy()
+    for horizon in horizons:
+        out = add_label_o2o_week(
+            out,
+            horizon=int(horizon),
+            stock_col=stock_col,
+            date_col=date_col,
+            open_col=open_col,
+            label_col=f'{prefix}{int(horizon)}',
+        )
+    return out
 
 
 def realized_o2o_week_for_anchor(

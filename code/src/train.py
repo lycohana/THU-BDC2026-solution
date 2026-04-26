@@ -9,7 +9,7 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from config import config
 from feature_registry import finalize_feature_frame, get_feature_columns, get_feature_engineer
-from labels import add_label_o2o_week
+from labels import add_label_o2o_week, build_aux_horizon_labels, build_quality_label, build_relevance_bins
 from model import StockTransformer
 from lgb_branch import fit_lgb_branches
 from utils import create_ranking_dataset_vectorized
@@ -30,10 +30,33 @@ def set_seed(seed=42):
 
 def _build_label_and_clean(processed, drop_small_open=True):
     """Build scorer-equivalent labels with the global market trading calendar."""
-    processed = add_label_o2o_week(processed, horizon=5, label_col='label')
+    label_cfg = config.get('labels', {})
+    processed = add_label_o2o_week(processed, horizon=5, label_col='raw5')
+    processed = build_quality_label(
+        processed,
+        raw_label_col='raw5',
+        output_col='quality5',
+        fee=label_cfg.get('fee', 0.0),
+        slippage=label_cfg.get('slippage', 0.0),
+        lambda_vol=label_cfg.get('lambda_vol', 0.0),
+        lambda_dd=label_cfg.get('lambda_dd', 0.0),
+        tradable_col=label_cfg.get('tradable_col'),
+        horizon=5,
+    )
+    processed = build_relevance_bins(
+        processed,
+        quality_col='quality5',
+        output_col='relevance5',
+        n_bins=label_cfg.get('relevance_bins', 5),
+    )
+    processed = build_aux_horizon_labels(
+        processed,
+        horizons=label_cfg.get('aux_horizons', (1, 3)),
+    )
+    processed['label'] = processed['quality5' if label_cfg.get('use_quality_label', True) else 'raw5']
     if drop_small_open:
         processed = processed[processed['开盘'] > 1e-4].copy()
-    return processed.dropna(subset=['label']).copy()
+    return processed.dropna(subset=['label', 'relevance5']).copy()
 
 
 def _preprocess_common(df, stockid2idx, desc, drop_small_open=True):

@@ -12,11 +12,13 @@ import torch
 from tqdm import tqdm
 
 from config import config
+from exp009_runtime import apply_exp009_meta, load_exp009_artifacts
 from features import build_history_feature_frame
 from feature_registry import finalize_feature_frame, get_feature_columns, get_feature_engineer
-from lgb_branch import load_lgb_branches, predict_lgb_score
+from lgb_branch import load_lgb_branches, predict_lgb_components, predict_lgb_score
 from model import StockTransformer
 from portfolio_utils import build_weight_portfolio, select_candidates as shared_select_candidates
+from reranker import apply_grr_top5
 
 
 PREDICT_CACHE_VERSION = 4
@@ -467,6 +469,13 @@ def normalize_score(x, mode):
     if mode == 'none':
         return np.asarray(x, dtype=np.float64)
     return zscore(x)
+
+
+def _env_bool(name, default=None):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
 def _rank_pct(series):
@@ -2499,6 +2508,7 @@ def main():
     inference_df = artifacts['inference_df']
     lgb_bundle = load_lgb_branches(model_dir)
     lgb_scores = predict_lgb_score(lgb_bundle, inference_df, config)
+    lgb_components = predict_lgb_components(lgb_bundle, inference_df)
     blend_cfg = config.get('blend', {})
     score_mode = blend_cfg.get('score_mode', 'blend')
     norm_mode = blend_cfg.get('normalize', 'zscore')
@@ -2531,6 +2541,15 @@ def main():
         'transformer': transformer_scores,
         'lgb': np.asarray(lgb_scores, dtype=np.float64) if lgb_scores is not None else np.full(len(sequence_stock_ids), np.nan),
     })
+    if lgb_components is not None:
+        component_name_map = {
+            'rank_score': 'lgb_rank_score',
+            'reg_score': 'lgb_reg_score',
+            'top5_rank_score': 'lgb_top5_score',
+        }
+        for raw_name, out_name in component_name_map.items():
+            if raw_name in lgb_components:
+                score_df[out_name] = np.asarray(lgb_components[raw_name], dtype=np.float64)
     score_df = score_df.merge(artifacts['risk_df'], on='stock_id', how='left')
     score_df['sigma20'] = score_df['sigma20'].fillna(score_df['sigma20'].median()).clip(lower=1e-4)
     score_df['median_amount20'] = score_df['median_amount20'].fillna(0.0)
@@ -2559,10 +2578,36 @@ def main():
 
     post_cfg = config.get('postprocess', {})
     selector_cfg = config.get('selector', {})
+    exp009_cfg = selector_cfg.get('exp009_meta', {})
+    exp009_enabled = _env_bool('BDC_EXP009_META_ENABLED', exp009_cfg.get('enabled', False))
+    grr_cfg = dict(config.get('grr_top5', {}))
+    grr_enabled = _env_bool('BDC_GRR_TOP5_ENABLED', grr_cfg.get('enabled', False))
+    grr_cfg['enabled'] = grr_enabled
     print(f'[BDC][predict] data_file={os.path.abspath(data_file)}')
     print(f'[BDC][predict] postprocess_filter={post_cfg.get("filter", "stable")}')
     print(f'[BDC][predict] selector_enabled={selector_cfg.get("enabled", False)}')
     print(f'[BDC][predict] output_path={os.path.abspath(output_path)}')
+    print(f'[BDC][predict] grr_top5_enabled={grr_enabled}')
+    print(f'[BDC][predict] exp009_meta_enabled={exp009_enabled}')
+    if grr_cfg.get('enabled', False):
+        grr_config = dict(config)
+        grr_config['grr_top5'] = grr_cfg
+        score_df = apply_grr_top5(score_df, grr_config)
+        if 'grr_final_score' in score_df.columns:
+            score_source = 'grr_top5:rrf+router'
+    if exp009_enabled:
+        exp009_dir = exp009_cfg.get('artifact_dir') or model_dir
+        exp009_artifacts = load_exp009_artifacts(exp009_dir)
+        if exp009_artifacts is None:
+            print('[BDC][exp009] artifacts missing, fallback to existing score')
+        else:
+            before_cols = set(score_df.columns)
+            score_df = apply_exp009_meta(score_df, exp009_artifacts)
+            if 'exp009_final_score' in score_df.columns:
+                score_df['score'] = score_df['exp009_final_score']
+                score_source = 'exp009_meta_badaware'
+            elif before_cols == set(score_df.columns):
+                print('[BDC][exp009] apply skipped, fallback to existing score')
     selector_info = None
     if selector_cfg.get('enabled', False) and score_mode == 'selector' and lgb_scores is not None:
         score_df = add_selector_scores(score_df)
@@ -2594,17 +2639,35 @@ def main():
     output_df = build_weight_portfolio(filtered, weighting_name, exposure_cap=exposure_cap)
     output_df.to_csv(output_path, index=False)
     score_df_path = os.environ.get('BDC_SCORE_DF_PATH', './temp/predict_score_df.csv')
+    exp009_live_path = os.environ.get('BDC_EXP009_LIVE_SCORE_DF_PATH', './temp/exp009_live_score_df.csv')
     filtered_path = os.environ.get('BDC_FILTERED_DF_PATH', './temp/predict_filtered_top30.csv')
     selector_json_path = os.environ.get('BDC_SELECTOR_JSON_PATH', './temp/selector_diagnostics.json')
     selector_csv_path = os.environ.get('BDC_SELECTOR_CSV_PATH', './temp/selector_diagnostics.csv')
     selector_debug_path = os.environ.get('BDC_SELECTOR_DEBUG_PATH', './temp/selector_candidates_debug.csv')
     gated_debug_path = os.environ.get('BDC_GATED_SELECTOR_DEBUG_PATH', './temp/gated_selector_debug.csv')
-    for path in [score_df_path, filtered_path, selector_json_path, selector_csv_path, selector_debug_path, gated_debug_path]:
+    for path in [score_df_path, exp009_live_path, filtered_path, selector_json_path, selector_csv_path, selector_debug_path, gated_debug_path]:
         path_dir = os.path.dirname(path)
         if path_dir:
             os.makedirs(path_dir, exist_ok=True)
 
     score_df.sort_values('score', ascending=False).to_csv(score_df_path, index=False)
+    if exp009_enabled or 'exp009_final_score' in score_df.columns:
+        exp009_cols = [
+            'stock_id',
+            'score',
+            'transformer',
+            'lgb',
+            'exp009_meta_raw',
+            'exp009_p_bad_1pct',
+            'exp009_p_bad_2pct',
+            'exp009_final_score',
+            'sigma20',
+            'ret5',
+            'ret20',
+            'amp20',
+        ]
+        live_cols = [col for col in exp009_cols if col in score_df.columns]
+        score_df.sort_values('score', ascending=False)[live_cols].to_csv(exp009_live_path, index=False)
     filtered.head(30).to_csv(filtered_path, index=False)
     if selector_info is not None:
         with open(selector_json_path, 'w', encoding='utf-8') as f:

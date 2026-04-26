@@ -856,6 +856,11 @@ def analyze_anchor_window(
     realized, score_window = realized_returns_for_anchor(raw, anchor, label_horizon=label_horizon)
     selected_score, selected_detail = score_result(artifacts["output_path"], realized)
     branch_table = branch_table_for_window(artifacts["score_df_path"], realized)
+    score_df = pd.read_csv(artifacts["score_df_path"], dtype={"stock_id": str})
+    guard_trigger_count = int(score_df.get("grr_tail_guard_triggered", pd.Series(False, index=score_df.index)).astype(str).str.lower().isin(["true", "1"]).sum())
+    guard_triggered = int(guard_trigger_count > 0)
+    high_risk_veto_count = int(score_df.get("grr_high_risk_chaser_veto", pd.Series(False, index=score_df.index)).astype(str).str.lower().isin(["true", "1"]).sum())
+    risk_off_score = float(pd.to_numeric(score_df.get("grr_risk_off_score", pd.Series(0.0, index=score_df.index)), errors="coerce").fillna(0.0).max())
 
     selector_info = artifacts["selector_info"]
     regime = selector_info.get("regime", "")
@@ -885,6 +890,10 @@ def analyze_anchor_window(
         "bad_count": int((selected_detail["realized_ret"] < -0.03).sum()),
         "very_bad_count": int((selected_detail["realized_ret"] < -0.05).sum()),
         "without_best": selected_score - float(selected_detail["contribution"].max()),
+        "guard_triggered": guard_triggered,
+        "guard_trigger_count": guard_trigger_count,
+        "high_risk_chaser_veto_count": high_risk_veto_count,
+        "grr_risk_off_score": risk_off_score,
     }
 
     selected_detail = selected_detail.copy()
@@ -926,6 +935,8 @@ def summarize_windows(summary: pd.DataFrame) -> dict:
         "selected_win_rate": float((summary["selected_score"] > 0).mean()),
         "mean_bad_count": float(summary["bad_count"].mean()),
         "mean_very_bad_count": float(summary["very_bad_count"].mean()),
+        "guard_trigger_count": int(summary.get("guard_triggered", pd.Series(0, index=summary.index)).sum()),
+        "mean_high_risk_chaser_veto_count": float(summary.get("high_risk_chaser_veto_count", pd.Series(0, index=summary.index)).mean()),
         "branch_usage": summary["chosen_branch"].value_counts().to_dict(),
         "note": "diagnostic replay with current model unless historical --model-dir is supplied",
     }

@@ -49,9 +49,28 @@ def _make_top5_heavy_gain_by_date(df, label_col='label', gain_cfg=None):
     return pd.Series(gain, index=df.index, dtype='int32')
 
 
-def build_lgb_rank_data(df, feature_cols, label_col='label'):
+def _rank_label_series(data, label_col='label', relevance_col='relevance5'):
+    if relevance_col in data.columns:
+        return pd.to_numeric(data[relevance_col], errors='coerce').fillna(0).astype(int)
+    return _make_gain_by_date(data, label_col=label_col).astype(int)
+
+
+def _label_gain_for_max_label(cfg, max_label):
+    gain = cfg.get('label_gain')
+    if gain is None:
+        gain = cfg.get('lgb', {}).get('label_gain')
+    if gain is None:
+        return None
+    gain = [int(x) for x in gain]
+    if len(gain) <= int(max_label):
+        last = gain[-1] if gain else 0
+        gain = gain + [last] * (int(max_label) + 1 - len(gain))
+    return gain
+
+
+def build_lgb_rank_data(df, feature_cols, label_col='label', relevance_col='relevance5'):
     data = df.sort_values(['日期', '股票代码']).reset_index(drop=True).copy()
-    data['gain'] = _make_gain_by_date(data, label_col=label_col)
+    data['gain'] = _rank_label_series(data, label_col=label_col, relevance_col=relevance_col)
     group = data.groupby('日期', sort=False).size().to_numpy()
     return _clean_feature_frame(data, feature_cols), data['gain'].astype(int), group
 
@@ -102,10 +121,11 @@ def _top5_ranker_params(cfg):
     seed = cfg.get('seed', 42)
     lgb_cfg = cfg.get('lgb', {})
     top5_cfg = _get_top5_cfg(cfg)
-    return {
-        'objective': 'lambdarank',
+    objective = top5_cfg.get('objective', lgb_cfg.get('rank_objective', 'lambdarank'))
+    params = {
+        'objective': objective,
         'metric': 'ndcg',
-        'ndcg_eval_at': [5],
+        'ndcg_eval_at': top5_cfg.get('eval_at', lgb_cfg.get('eval_at', cfg.get('eval_at', [5]))),
         'learning_rate': top5_cfg.get('learning_rate', lgb_cfg.get('rank_learning_rate', 0.03)),
         'n_estimators': top5_cfg.get('n_estimators', lgb_cfg.get('rank_n_estimators', 1500)),
         'num_leaves': top5_cfg.get('num_leaves', min(int(lgb_cfg.get('num_leaves', 63)), 31)),
@@ -118,6 +138,10 @@ def _top5_ranker_params(cfg):
         'n_jobs': top5_cfg.get('n_jobs', lgb_cfg.get('n_jobs', 8)),
         'verbosity': -1,
     }
+    label_gain = _label_gain_for_max_label(top5_cfg, max(top5_cfg.get('top5_gain', 10), top5_cfg.get('top10_gain', 4)))
+    if label_gain is not None and objective in {'lambdarank', 'rank_xendcg'}:
+        params['label_gain'] = label_gain
+    return params
 
 
 def fit_lgb_top5_ranker(train_df, valid_df, feature_cols, output_dir, cfg):
@@ -308,22 +332,27 @@ def fit_lgb_branches_with_search(train_df, valid_df, feature_cols, output_dir, c
     print(f'[BDC][lgb_search] 最优配置：{best_params}, valid_score={best_score:.6f}')
 
     # 用最优配置重新训练最终模型
-    ranker = lgb.LGBMRanker(
-        objective='lambdarank',
-        metric='ndcg',
-        ndcg_eval_at=[5],
-        learning_rate=best_params['learning_rate'],
-        n_estimators=lgb_cfg.get('rank_n_estimators', 1500),
-        num_leaves=best_params['num_leaves'],
-        min_child_samples=best_params['min_child_samples'],
-        subsample=lgb_cfg.get('subsample', 0.8),
-        subsample_freq=1,
-        colsample_bytree=lgb_cfg.get('colsample_bytree', 0.7),
-        reg_lambda=lgb_cfg.get('reg_lambda', 2.0),
-        random_state=seed,
-        n_jobs=lgb_cfg.get('n_jobs', 8),
-        verbosity=-1,
-    )
+    rank_objective = lgb_cfg.get('rank_objective', 'lambdarank')
+    rank_params = {
+        'objective': rank_objective,
+        'metric': 'ndcg',
+        'ndcg_eval_at': lgb_cfg.get('eval_at', cfg.get('eval_at', [5])),
+        'learning_rate': best_params['learning_rate'],
+        'n_estimators': lgb_cfg.get('rank_n_estimators', 1500),
+        'num_leaves': best_params['num_leaves'],
+        'min_child_samples': best_params['min_child_samples'],
+        'subsample': lgb_cfg.get('subsample', 0.8),
+        'subsample_freq': 1,
+        'colsample_bytree': lgb_cfg.get('colsample_bytree', 0.7),
+        'reg_lambda': lgb_cfg.get('reg_lambda', 2.0),
+        'random_state': seed,
+        'n_jobs': lgb_cfg.get('n_jobs', 8),
+        'verbosity': -1,
+    }
+    label_gain = _label_gain_for_max_label(cfg, int(max(y_rank_tr.max(), y_rank_va.max())))
+    if label_gain is not None and rank_objective in {'lambdarank', 'rank_xendcg'}:
+        rank_params['label_gain'] = label_gain
+    ranker = lgb.LGBMRanker(**rank_params)
     ranker.fit(
         X_rank_tr,
         y_rank_tr,
@@ -380,6 +409,10 @@ def fit_lgb_branches_with_search(train_df, valid_df, feature_cols, output_dir, c
         'num_valid_rows': int(len(valid_df)),
         'search_best_params': best_params,
         'search_best_score': best_score,
+        'rank_objective': rank_objective,
+        'rank_eval_at': rank_params['ndcg_eval_at'],
+        'rank_label': 'relevance5' if 'relevance5' in train_df.columns else 'cross_section_gain',
+        'label_gain': rank_params.get('label_gain'),
     }
 
     joblib.dump(ranker, os.path.join(output_dir, LGB_RANKER_FILE))
@@ -405,22 +438,27 @@ def _train_one_config(X_rank_tr, y_rank_tr, g_rank_tr, X_rank_va, y_rank_va, g_r
     """训练单个超参配置并返回验证分数"""
     import lightgbm as lgb
 
-    ranker = lgb.LGBMRanker(
-        objective='lambdarank',
-        metric='ndcg',
-        ndcg_eval_at=[5],
-        learning_rate=learning_rate,
-        n_estimators=lgb_cfg.get('rank_n_estimators', 1500),
-        num_leaves=num_leaves,
-        min_child_samples=min_child_samples,
-        subsample=lgb_cfg.get('subsample', 0.8),
-        subsample_freq=1,
-        colsample_bytree=lgb_cfg.get('colsample_bytree', 0.7),
-        reg_lambda=lgb_cfg.get('reg_lambda', 2.0),
-        random_state=seed,
-        n_jobs=lgb_cfg.get('n_jobs', 8),
-        verbosity=-1,
-    )
+    rank_objective = lgb_cfg.get('rank_objective', 'lambdarank')
+    rank_params = {
+        'objective': rank_objective,
+        'metric': 'ndcg',
+        'ndcg_eval_at': lgb_cfg.get('eval_at', cfg.get('eval_at', [5])),
+        'learning_rate': learning_rate,
+        'n_estimators': lgb_cfg.get('rank_n_estimators', 1500),
+        'num_leaves': num_leaves,
+        'min_child_samples': min_child_samples,
+        'subsample': lgb_cfg.get('subsample', 0.8),
+        'subsample_freq': 1,
+        'colsample_bytree': lgb_cfg.get('colsample_bytree', 0.7),
+        'reg_lambda': lgb_cfg.get('reg_lambda', 2.0),
+        'random_state': seed,
+        'n_jobs': lgb_cfg.get('n_jobs', 8),
+        'verbosity': -1,
+    }
+    label_gain = _label_gain_for_max_label(cfg, int(max(y_rank_tr.max(), y_rank_va.max())))
+    if label_gain is not None and rank_objective in {'lambdarank', 'rank_xendcg'}:
+        rank_params['label_gain'] = label_gain
+    ranker = lgb.LGBMRanker(**rank_params)
     ranker.fit(
         X_rank_tr,
         y_rank_tr,
@@ -487,22 +525,27 @@ def fit_lgb_branches(train_df, valid_df, feature_cols, output_dir, cfg):
     X_reg_tr, y_reg_tr = build_lgb_reg_data(train_df, feature_cols, label_clip=label_clip)
     X_reg_va, y_reg_va = build_lgb_reg_data(valid_df, feature_cols, label_clip=label_clip)
 
-    ranker = lgb.LGBMRanker(
-        objective='lambdarank',
-        metric='ndcg',
-        ndcg_eval_at=[5],
-        learning_rate=lgb_cfg.get('rank_learning_rate', 0.03),
-        n_estimators=lgb_cfg.get('rank_n_estimators', 1500),
-        num_leaves=lgb_cfg.get('num_leaves', 63),
-        min_child_samples=lgb_cfg.get('min_child_samples', 64),
-        subsample=lgb_cfg.get('subsample', 0.8),
-        subsample_freq=1,
-        colsample_bytree=lgb_cfg.get('colsample_bytree', 0.7),
-        reg_lambda=lgb_cfg.get('reg_lambda', 2.0),
-        random_state=seed,
-        n_jobs=lgb_cfg.get('n_jobs', 8),
-        verbosity=-1,
-    )
+    rank_objective = lgb_cfg.get('rank_objective', 'lambdarank')
+    rank_params = {
+        'objective': rank_objective,
+        'metric': 'ndcg',
+        'ndcg_eval_at': lgb_cfg.get('eval_at', cfg.get('eval_at', [5])),
+        'learning_rate': lgb_cfg.get('rank_learning_rate', 0.03),
+        'n_estimators': lgb_cfg.get('rank_n_estimators', 1500),
+        'num_leaves': lgb_cfg.get('num_leaves', 63),
+        'min_child_samples': lgb_cfg.get('min_child_samples', 64),
+        'subsample': lgb_cfg.get('subsample', 0.8),
+        'subsample_freq': 1,
+        'colsample_bytree': lgb_cfg.get('colsample_bytree', 0.7),
+        'reg_lambda': lgb_cfg.get('reg_lambda', 2.0),
+        'random_state': seed,
+        'n_jobs': lgb_cfg.get('n_jobs', 8),
+        'verbosity': -1,
+    }
+    label_gain = _label_gain_for_max_label(cfg, int(max(y_rank_tr.max(), y_rank_va.max())))
+    if label_gain is not None and rank_objective in {'lambdarank', 'rank_xendcg'}:
+        rank_params['label_gain'] = label_gain
+    ranker = lgb.LGBMRanker(**rank_params)
     ranker.fit(
         X_rank_tr,
         y_rank_tr,
@@ -557,6 +600,10 @@ def fit_lgb_branches(train_df, valid_df, feature_cols, output_dir, cfg):
         'num_features': len(feature_cols),
         'num_train_rows': int(len(train_df)),
         'num_valid_rows': int(len(valid_df)),
+        'rank_objective': rank_objective,
+        'rank_eval_at': lgb_cfg.get('eval_at', cfg.get('eval_at', [5])),
+        'rank_label': 'relevance5' if 'relevance5' in train_df.columns else 'cross_section_gain',
+        'label_gain': rank_params.get('label_gain'),
     }
 
     joblib.dump(ranker, os.path.join(output_dir, LGB_RANKER_FILE))

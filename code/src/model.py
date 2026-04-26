@@ -54,6 +54,75 @@ class FeatureAttention(nn.Module):
         attended = torch.sum(x * attention_weights, dim=1)  # [batch*num_stocks, d_model]
         return self.dropout(attended)
 
+
+class PatchEmbedding1D(nn.Module):
+    """Convert a noisy daily sequence into local temporal patches."""
+    def __init__(self, input_dim, d_model, patch_len=5, stride=5, dropout=0.1):
+        super(PatchEmbedding1D, self).__init__()
+        self.input_dim = input_dim
+        self.patch_len = max(1, int(patch_len))
+        self.stride = max(1, int(stride))
+        self.proj = nn.Linear(self.patch_len * input_dim, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: [batch*num_stocks, seq_len, feature_dim]
+        if x.size(1) < self.patch_len:
+            pad_len = self.patch_len - x.size(1)
+            x = F.pad(x, (0, 0, pad_len, 0))
+        patches = x.unfold(dimension=1, size=self.patch_len, step=self.stride)
+        patches = patches.contiguous().view(x.size(0), patches.size(1), -1)
+        return self.dropout(self.proj(patches))
+
+
+class CandidateReranker(nn.Module):
+    """Self-attention reranker for the small union-topK candidate pool."""
+    def __init__(self, input_dim, d_model=128, nhead=4, num_layers=2, dropout=0.1):
+        super(CandidateReranker, self).__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 2,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.score_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1),
+        )
+
+    def forward(self, candidate_features, mask=None):
+        x = self.input_proj(candidate_features)
+        padding_mask = None
+        if mask is not None:
+            padding_mask = ~mask.bool()
+        x = self.encoder(x, src_key_padding_mask=padding_mask)
+        scores = self.score_head(self.norm(x)).squeeze(-1)
+        if mask is not None:
+            scores = scores.masked_fill(~mask.bool(), -1e9)
+        return scores
+
+
+class RouterMLP(nn.Module):
+    """Small regime router that emits dynamic expert weights."""
+    def __init__(self, input_dim, num_experts, hidden_dim=32, dropout=0.1):
+        super(RouterMLP, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_experts),
+        )
+
+    def forward(self, state_features):
+        return torch.softmax(self.net(state_features), dim=-1)
+
+
 class StockTransformer(nn.Module):
     def __init__(self, input_dim, config, num_stocks, emb_dim=16):
         super(StockTransformer, self).__init__()
@@ -61,9 +130,21 @@ class StockTransformer(nn.Module):
         self.config = config
         self.num_stocks = num_stocks
         
-        # 输入投影层
-        self.input_proj = nn.Linear(input_dim, config['d_model'])
-        self.pos_encoder = PositionalEncoding(config['d_model'], config['dropout'], config['sequence_length'])
+        patch_cfg = config.get('patch', {})
+        self.use_patch = bool(patch_cfg.get('enabled', False))
+        if self.use_patch:
+            self.input_proj = PatchEmbedding1D(
+                input_dim,
+                config['d_model'],
+                patch_len=patch_cfg.get('patch_len', config.get('patch_len', 5)),
+                stride=patch_cfg.get('patch_stride', config.get('patch_stride', 5)),
+                dropout=config['dropout'],
+            )
+            max_len = math.ceil(max(1, config['sequence_length']) / max(1, patch_cfg.get('patch_stride', config.get('patch_stride', 5)))) + 2
+        else:
+            self.input_proj = nn.Linear(input_dim, config['d_model'])
+            max_len = config['sequence_length']
+        self.pos_encoder = PositionalEncoding(config['d_model'], config['dropout'], max_len)
         
         # 时序特征提取
         encoder_layer = nn.TransformerEncoderLayer(
@@ -120,7 +201,7 @@ class StockTransformer(nn.Module):
         src_reshaped = src.view(batch_size * num_stocks, seq_len, feature_dim)
         
         # 输入投影和位置编码
-        src_proj = self.input_proj(src_reshaped)  # [batch*num_stocks, seq_len, d_model]
+        src_proj = self.input_proj(src_reshaped)  # [batch*num_stocks, seq/patch_len, d_model]
         src_proj = self.pos_encoder(src_proj)
         
         # 时序特征提取
@@ -148,4 +229,3 @@ class StockTransformer(nn.Module):
         output = scores.view(batch_size, num_stocks)  # [batch, num_stocks]
         
         return output
-
