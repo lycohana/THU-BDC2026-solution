@@ -1,0 +1,9 @@
+{
+  "exp008_mean": 0.02059240533871063,
+  "branch_oracle_mean": 0.05281816842632904,
+  "candidate_oracle_mean": 0.0769367099913864,
+  "exp008_vs_baseline_offline_mean_gap": 0.01384736599458307,
+  "branch_oracle_vs_baseline_offline_gap": 0.04607312908220148,
+  "candidate_oracle_vs_baseline_offline_gap": 0.07019167064725884,
+  "conclusion": "exp008 均值已高于 baseline 离线对照；本轮报告仅保留 oracle gap 诊断。"
+}

@@ -1,0 +1,39 @@
+{
+  "asof": "2026-04-07",
+  "core": "exp008",
+  "overlay": "exp009_veto_only",
+  "regime": "defensive",
+  "confidence": 0.99,
+  "tailrisk_flag": true,
+  "corr_cluster_flag": true,
+  "unknown_industry_flag": true,
+  "high_risk": true,
+  "veto": {
+    "regime": "defensive",
+    "confidence": 0.99,
+    "tailrisk_flag": true,
+    "corr_cluster_flag": true,
+    "unknown_industry_flag": true,
+    "max_core_corr": 0.5780122929930898,
+    "high_risk": true,
+    "veto_triggered": false,
+    "replaced_out": null,
+    "replaced_in": null,
+    "reason": "no_replacement_pool"
+  },
+  "core_top5": [
+    "603799",
+    "688008",
+    "600023",
+    "688981",
+    "603259"
+  ],
+  "final_top5": [
+    "603799",
+    "688008",
+    "600023",
+    "688981",
+    "603259"
+  ],
+  "score_self": 0.060613242251354116
+}

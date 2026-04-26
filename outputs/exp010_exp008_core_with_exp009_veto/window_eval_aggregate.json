@@ -1,0 +1,12 @@
+{
+  "windows": 10,
+  "mean_selected_score": 0.020110129140651745,
+  "median_selected_score": 0.01505373903725369,
+  "q10_selected_score": -0.009063211152208355,
+  "worst_selected_score": -0.012716062404241701,
+  "bad_count": 2,
+  "very_bad_count": 0,
+  "veto_count": 2,
+  "mean_turnover_vs_prev": 1.1400000000000001,
+  "mean_overlap_vs_prev": 0.29682539682539677
+}
