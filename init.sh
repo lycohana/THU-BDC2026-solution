@@ -3,7 +3,7 @@ set -euo pipefail
 
 mkdir -p /app/model /app/output /app/temp model output temp
 
-uv run python - <<'PY'
+python - <<'PY'
 import platform
 import sys
 

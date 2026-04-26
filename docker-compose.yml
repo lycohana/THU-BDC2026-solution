@@ -4,14 +4,13 @@ services:
     pull_policy: never
     volumes:
       - ./app/data:/app/data
-      - ./app/model:/app/model
       - ./app/output:/app/output
       - ./app/temp:/app/temp
     working_dir: /app
-    command: bash -lc "uv run python app/code/src/test.py"
+    command: bash -c "python app/code/src/test.py"
     runtime: nvidia
     environment:
-      - BDC_DATA_FILE=/app/data/train_hs300_20260424.csv
+      - BDC_DATA_FILE=/app/model/input/train_hs300_latest.csv
       - BDC_OUTPUT_PATH=/app/output/result.csv
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all

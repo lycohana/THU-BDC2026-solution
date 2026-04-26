@@ -287,7 +287,13 @@ config = {
         },
     },
     'postprocess': {
-        'filter': 'regime_liquidity_risk_off',
+        'filter': 'regime_liquidity_anchor_risk_off',
+        'available_filters': [
+            'regime_liquidity_anchor_risk_off',
+            'regime_ai_hardware_mainline_v1',
+            'regime_theme_consensus_top20_v1',
+            'regime_theme_consensus_top20_v2',
+        ],
         'weighting': 'equal',
         'liquidity_quantile': 0.10,
         'sigma_quantile': 0.85,

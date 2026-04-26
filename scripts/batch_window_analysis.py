@@ -27,6 +27,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "code" / "src"))
 from config import config as PROJECT_CONFIG  # noqa: E402
+from labels import realized_o2o_week_for_anchor  # noqa: E402
+from portfolio_utils import apply_filter  # noqa: E402
 
 
 def stable_hash(obj: object) -> str:
@@ -86,22 +88,8 @@ def parse_anchor_args(args: argparse.Namespace, dates: list[pd.Timestamp]) -> li
 
 
 def realized_returns_for_anchor(raw: pd.DataFrame, anchor: pd.Timestamp, label_horizon: int = 5) -> tuple[pd.DataFrame, str]:
-    dates = sorted(raw["日期"].dropna().unique())
-    idx = dates.index(anchor)
-    d1 = pd.Timestamp(dates[idx + 1])
-    d5 = pd.Timestamp(dates[idx + label_horizon])
-
-    open1 = raw[raw["日期"] == d1][["股票代码", "开盘"]].rename(
-        columns={"股票代码": "stock_id", "开盘": "open_day1"}
-    )
-    open5 = raw[raw["日期"] == d5][["股票代码", "开盘"]].rename(
-        columns={"股票代码": "stock_id", "开盘": "open_day5"}
-    )
-    ret = open1.merge(open5, on="stock_id", how="inner")
-    ret["realized_ret"] = pd.to_numeric(ret["open_day5"], errors="coerce") / (
-        pd.to_numeric(ret["open_day1"], errors="coerce") + 1e-12
-    ) - 1.0
-    return ret[["stock_id", "open_day1", "open_day5", "realized_ret"]], f"{d1:%Y-%m-%d}~{d5:%Y-%m-%d}"
+    realized, score_window = realized_o2o_week_for_anchor(raw, anchor, horizon=label_horizon)
+    return realized.rename(columns={f"open_day{label_horizon}": "open_day5"}), score_window
 
 
 def score_result(result_path: Path, realized: pd.DataFrame) -> tuple[float, pd.DataFrame]:
@@ -177,6 +165,13 @@ def add_branch_diagnostic_features(df: pd.DataFrame) -> pd.DataFrame:
             - 0.10 * out.get("max_drawdown20_rank", 0.0)
             - 0.05 * out.get("amp_rank", 0.0)
         )
+    if "score_reference_baseline" not in out.columns:
+        out["score_reference_baseline"] = out["transformer"] if "transformer" in out.columns else out.get("score", 0.0)
+    if "score_baseline_model_hybrid" not in out.columns:
+        baseline_rank = rank_pct(out["score_reference_baseline"])
+        model_rank = rank_pct(out["score"]) if "score" in out.columns else baseline_rank
+        lgb_rank = rank_pct(out["lgb"]) if "lgb" in out.columns else model_rank
+        out["score_baseline_model_hybrid"] = 0.40 * baseline_rank + 0.40 * model_rank + 0.20 * lgb_rank
     if "tail_risk_score" not in out.columns:
         out["tail_risk_score"] = (
             0.20 * out["sigma_rank"]
@@ -226,8 +221,11 @@ def top20_overlap(work: pd.DataFrame) -> float:
     if not {"lgb_norm", "tf_norm", "stock_id"}.issubset(work.columns) or len(work) == 0:
         return 0.0
     k = min(20, len(work))
-    lgb_top = set(work.nlargest(k, "lgb_norm")["stock_id"])
-    tf_top = set(work.nlargest(k, "tf_norm")["stock_id"])
+    local = work.copy()
+    local["lgb_norm"] = pd.to_numeric(local["lgb_norm"], errors="coerce").fillna(0.0)
+    local["tf_norm"] = pd.to_numeric(local["tf_norm"], errors="coerce").fillna(0.0)
+    lgb_top = set(local.nlargest(k, "lgb_norm")["stock_id"])
+    tf_top = set(local.nlargest(k, "tf_norm")["stock_id"])
     return float(len(lgb_top & tf_top) / max(k, 1))
 
 
@@ -288,6 +286,8 @@ def branch_diagnostics(work: pd.DataFrame, score_col: str) -> dict:
 def filter_branch(work: pd.DataFrame, filter_name: str) -> pd.DataFrame:
     if filter_name in {"none", "nofilter"}:
         return work.copy()
+    if filter_name.startswith("portfolio:"):
+        return apply_filter(work.copy(), filter_name.split(":", 1)[1], liquidity_quantile=0.10, sigma_quantile=0.85)
     cond = pd.Series(True, index=work.index)
     if filter_name == "stable":
         cond &= work["median_amount20"] >= work["median_amount20"].quantile(0.10)
@@ -316,6 +316,11 @@ def filter_branch(work: pd.DataFrame, filter_name: str) -> pd.DataFrame:
 
 def branch_definitions() -> list[dict]:
     return [
+        {"branch": "reference_baseline_branch", "score_col": "score_reference_baseline", "filter": "nofilter"},
+        {"branch": "ai_hardware_mainline_v1", "score_col": "score", "filter": "portfolio:regime_ai_hardware_mainline_v1"},
+        {"branch": "current_aggressive", "score_col": "score", "filter": "portfolio:regime_liquidity_anchor_risk_off"},
+        {"branch": "trend_uncluttered", "score_col": "score", "filter": "portfolio:regime_trend_uncluttered_plus_reversal"},
+        {"branch": "baseline_model_hybrid", "score_col": "score_baseline_model_hybrid", "filter": "nofilter"},
         {"branch": "lgb_only_guarded", "score_col": "score_lgb_only", "filter": "stable"},
         {"branch": "balanced_guarded", "score_col": "score_balanced", "filter": "stable"},
         {"branch": "conservative_softrisk_v2", "score_col": "score_conservative_softrisk_v2", "filter": "liquidity_q05"},
@@ -565,6 +570,8 @@ def score_branch(work: pd.DataFrame, branch: str, score_col: str, filter_name: s
     else:
         rank_col = score_col
 
+    candidates = candidates.copy()
+    candidates[rank_col] = pd.to_numeric(candidates[rank_col], errors="coerce").fillna(0.0)
     top = candidates.sort_values(rank_col, ascending=False).head(5).copy()
     if len(top) == 0:
         return {}

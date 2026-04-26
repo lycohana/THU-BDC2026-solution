@@ -1,6 +1,6 @@
 # THU-BDC2026 代码说明
 
-本项目为 THU-BDC2026 股票 Top5 选股/配权方案。最终推理入口生成 `output/result.csv`，格式为 `stock_id,weight`，最多 5 只股票，总权重不超过 1。
+本项目为 THU-BDC2026 股票 Top5 选股/配权方案。最终推理入口生成 `output/result.csv`，格式为 `stock_id,weight`，最多 5 只股票，总权重不超过 1。当前正式推理数据为 `model/input/train_hs300_latest.csv`，历史行情截至 `2026-04-24`，用于给出下一交易日 `2026-04-27` 的 Top5 组合。该文件随模型一起放在非挂载目录中，避免官方复现时 `data/temp/output` 挂载覆盖。
 
 当前根目录 `readme.md` 面向代码审核、Docker 复现和最终提交准备。研发过程、实验流水账和 Todo 记录已移至 [docs/DEV_README.md](docs/DEV_README.md)。
 
@@ -24,6 +24,7 @@
 
 - `data/train.csv`：用于训练、验证、walk-forward OOF、融合权重和后处理策略选择。
 - `data/test.csv`：只用于固定规则后的最终推理和本地 `score_self.py` 记录，不用于调参、选模型、选股票或改权重。
+- `model/input/train_hs300_latest.csv`：正式推理输入，覆盖 `2024-01-02` 至 `2026-04-24` 的沪深300历史行情，用于生成 `2026-04-27` 组合。该文件放在非挂载目录，避免官方复现时 `data/temp/output` 挂载覆盖。
 
 当前不使用任何外部公开数据、词典、embedding 或预训练模型，因此当前版本无需外部资源报备。若后续加入外部资源，必须满足开源时间和邮件报备要求，并在本文档补充链接、md5 和用途。
 
@@ -107,7 +108,7 @@ postprocess.sigma_quantile = 0.85
 训练入口：
 
 ```bash
-uv run python app/code/src/train.py
+bash app/train.sh
 ```
 
 主要步骤：
@@ -140,18 +141,18 @@ model/exp-002-05_60_158+39/
 推理入口：
 
 ```bash
-uv run python app/code/src/test.py
+bash test.sh
 ```
 
 主要步骤：
 
-1. 读取 `data/train_hs300_20260424.csv`，取最新交易日 2026-04-24 作为预测日。
+1. 读取 `model/input/train_hs300_latest.csv`，取最新交易日 `2026-04-24` 作为推理基准日，输出下一交易日 `2026-04-27` 组合。
 2. 构造与训练一致的特征，并按 `scaler.feature_names_in_` 对齐。
 3. 构造每只股票最近 60 个交易日的输入序列。
 4. 加载 Transformer 和 LightGBM 产物。
 5. 分别计算 Transformer 分数和 LightGBM 分数。
 6. 对两个分支分数做横截面 z-score，并按 `0.30 / 0.70` 融合。
-7. 使用 `stable` 过滤候选股票，当前阈值为流动性分位 `0.10`、波动率分位 `0.85`。
+7. 使用 `regime_liquidity_anchor_risk_off` 过滤与重排候选股票，当前阈值为流动性分位 `0.10`、波动率分位 `0.85`。
 8. 选 Top5 并等权输出。
 9. 写入 `output/result.csv`。
 
@@ -159,17 +160,17 @@ uv run python app/code/src/test.py
 
 ```csv
 stock_id,weight
-600015,0.2
-601018,0.2
-601077,0.2
-002384,0.2
-300274,0.2
+000977,0.2
+688256,0.2
+600547,0.2
+603019,0.2
+688041,0.2
 ```
 
 本地固定规则后记录分数：
 
 ```text
-score_self.py = 0.09719554955415999
+score_self.py = 0.13198580335505333
 ```
 
 该分数为当前固定提交规则后的本地记录。`data/test.csv` 的未来收益只用于本地评分脚本记录，不进入模型训练、推理特征或提交逻辑。

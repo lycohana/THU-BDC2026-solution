@@ -18,3 +18,5 @@ model_backups
 test/output
 test/results_output
 test/tars
+outputs
+*.tar

@@ -12,13 +12,14 @@ import torch
 from tqdm import tqdm
 
 from config import config
+from features import build_history_feature_frame
 from feature_registry import finalize_feature_frame, get_feature_columns, get_feature_engineer
 from lgb_branch import load_lgb_branches, predict_lgb_score
 from model import StockTransformer
 from portfolio_utils import build_weight_portfolio, select_candidates as shared_select_candidates
 
 
-PREDICT_CACHE_VERSION = 3
+PREDICT_CACHE_VERSION = 4
 
 
 def _file_fingerprint(path):
@@ -193,6 +194,8 @@ def build_inference_sequences(data, features, sequence_length, latest_date):
 
 
 def build_risk_frame(raw_df):
+    return build_history_feature_frame(raw_df)
+
     hist = raw_df.groupby('股票代码', sort=False).tail(80).copy()
     if hist.empty:
         return pd.DataFrame(columns=[
@@ -214,10 +217,16 @@ def build_risk_frame(raw_df):
     hist['最高'] = hist['最高'].astype(float)
     hist['最低'] = hist['最低'].astype(float)
     hist['成交额'] = hist['成交额'].astype(float)
+    if '换手率' in hist.columns:
+        hist['换手率'] = hist['换手率'].astype(float)
+    else:
+        hist['换手率'] = 0.0
 
     hist['ret1'] = hist.groupby('股票代码', sort=False)['收盘'].pct_change(fill_method=None)
     hist['close_lag5'] = hist.groupby('股票代码', sort=False)['收盘'].shift(5)
+    hist['close_lag10'] = hist.groupby('股票代码', sort=False)['收盘'].shift(10)
     hist['market_ret1'] = hist.groupby('日期', sort=False)['ret1'].transform('mean')
+    hist['daily_amp'] = (hist['最高'] - hist['最低']) / (hist['收盘'].abs() + 1e-12)
 
     grouped = hist.groupby('股票代码', sort=False)
     recent20 = grouped.tail(21).copy()
@@ -225,28 +234,55 @@ def build_risk_frame(raw_df):
     agg = grouped20.agg(
         sigma20=('ret1', 'std'),
         median_amount20=('成交额', 'median'),
+        mean_amount20=('成交额', 'mean'),
+        turnover20=('换手率', 'mean'),
         first_close=('收盘', 'first'),
         max_high=('最高', 'max'),
         min_low=('最低', 'min'),
         row_count=('收盘', 'size'),
     )
+    recent10 = grouped.tail(10).copy()
+    grouped10 = recent10.groupby('股票代码', sort=False)
+    agg10 = grouped10.agg(
+        vol10=('ret1', 'std'),
+        amp_mean10=('daily_amp', 'mean'),
+    )
+    recent5 = grouped.tail(5).copy()
+    grouped5 = recent5.groupby('股票代码', sort=False)
+    agg5 = grouped5.agg(
+        mean_amount5=('成交额', 'mean'),
+        turnover5=('换手率', 'mean'),
+    )
     latest = grouped.tail(1).set_index('股票代码').reindex(agg.index)
 
     last_close = latest['收盘'].to_numpy(dtype=np.float64)
     close_lag5 = latest['close_lag5'].fillna(0.0).to_numpy(dtype=np.float64)
+    close_lag10 = latest['close_lag10'].fillna(0.0).to_numpy(dtype=np.float64)
     first_close = agg['first_close'].to_numpy(dtype=np.float64)
     row_count = agg['row_count'].to_numpy(dtype=np.int64)
+    high20 = agg['max_high'].to_numpy(dtype=np.float64)
+    low20 = agg['min_low'].to_numpy(dtype=np.float64)
 
     risk = pd.DataFrame(index=agg.index)
     risk['sigma20'] = agg['sigma20'].fillna(0.0).to_numpy(dtype=np.float64)
     risk['median_amount20'] = agg['median_amount20'].fillna(0.0).to_numpy(dtype=np.float64)
+    risk['mean_amount20'] = agg['mean_amount20'].fillna(0.0).to_numpy(dtype=np.float64)
+    risk['turnover20'] = agg['turnover20'].fillna(0.0).to_numpy(dtype=np.float64)
+    risk['vol10'] = agg10.reindex(agg.index)['vol10'].fillna(0.0).to_numpy(dtype=np.float64)
+    risk['amp_mean10'] = agg10.reindex(agg.index)['amp_mean10'].fillna(0.0).to_numpy(dtype=np.float64)
     risk['ret1'] = latest['ret1'].fillna(0.0).to_numpy(dtype=np.float64)
     risk['ret5'] = np.where(row_count >= 6, last_close / (close_lag5 + 1e-12) - 1.0, 0.0)
+    risk['ret10'] = np.where(row_count >= 11, last_close / (close_lag10 + 1e-12) - 1.0, 0.0)
     risk['ret20'] = np.where(row_count >= 2, last_close / (first_close + 1e-12) - 1.0, 0.0)
     risk['amp20'] = (
-        (agg['max_high'].to_numpy(dtype=np.float64) - agg['min_low'].to_numpy(dtype=np.float64))
+        (high20 - low20)
         / (last_close + 1e-12)
     )
+    risk['pos20'] = (last_close - low20) / (high20 - low20 + 1e-12)
+    amount5 = agg5.reindex(agg.index)['mean_amount5'].fillna(0.0).to_numpy(dtype=np.float64)
+    turnover5 = agg5.reindex(agg.index)['turnover5'].fillna(0.0).to_numpy(dtype=np.float64)
+    risk['amt_ratio5'] = amount5 / (risk['mean_amount20'].to_numpy(dtype=np.float64) + 1e-12)
+    risk['to_ratio5'] = turnover5 / (risk['turnover20'].to_numpy(dtype=np.float64) + 1e-12)
 
     beta_rows = []
     for stock_id, group in grouped:
@@ -389,8 +425,13 @@ def score_soft_weights(candidates, k=5, tau=1.0, max_weight=0.50, min_weight=0.0
     return out
 
 
-def select_candidates(score_df, post_cfg=None):
-    return shared_select_candidates(score_df, post_cfg=post_cfg or config.get('postprocess', {}))
+def select_candidates(score_df, post_cfg=None, history_df=None, asof_date=None):
+    return shared_select_candidates(
+        score_df,
+        post_cfg=post_cfg or config.get('postprocess', {}),
+        history_df=history_df,
+        asof_date=asof_date,
+    )
 
 
 def select_weighting_func(weighting_name):
@@ -2380,11 +2421,29 @@ def _get_autocast_context(device):
     return torch.autocast(device_type='cuda', dtype=torch.float16), True
 
 
-def main():
-    data_file = os.environ.get(
-        'BDC_DATA_FILE',
-        os.path.join(config['data_path'], 'train_hs300_20260424.csv'),
+def _resolve_data_file():
+    candidates = []
+    env_data_file = os.environ.get('BDC_DATA_FILE')
+    if env_data_file:
+        candidates.append(env_data_file)
+
+    candidates.extend([
+        os.path.join('./model', 'input', 'train_hs300_latest.csv'),
+        os.path.join(config['data_path'], 'train_hs300_latest.csv'),
+        os.path.join(config['data_path'], 'train.csv'),
+    ])
+
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+
+    raise FileNotFoundError(
+        '未找到推理数据文件，已检查: ' + ', '.join(candidates)
     )
+
+
+def main():
+    data_file = _resolve_data_file()
     model_dir = _resolve_model_dir()
     model_path = os.path.join(model_dir, 'best_model.pth')
     scaler_path = os.path.join(model_dir, 'scaler.pkl')
@@ -2478,9 +2537,17 @@ def main():
     for col in [
         'ret1',
         'ret5',
+        'ret10',
         'ret20',
         'amp20',
+        'amp_mean10',
+        'vol10',
+        'pos20',
         'amount20',
+        'mean_amount20',
+        'turnover20',
+        'amt_ratio5',
+        'to_ratio5',
         'return_1',
         'return_5',
         'beta60',
@@ -2492,6 +2559,10 @@ def main():
 
     post_cfg = config.get('postprocess', {})
     selector_cfg = config.get('selector', {})
+    print(f'[BDC][predict] data_file={os.path.abspath(data_file)}')
+    print(f'[BDC][predict] postprocess_filter={post_cfg.get("filter", "stable")}')
+    print(f'[BDC][predict] selector_enabled={selector_cfg.get("enabled", False)}')
+    print(f'[BDC][predict] output_path={os.path.abspath(output_path)}')
     selector_info = None
     if selector_cfg.get('enabled', False) and score_mode == 'selector' and lgb_scores is not None:
         score_df = add_selector_scores(score_df)
@@ -2504,7 +2575,12 @@ def main():
         exposure_cap = selector_info['exposure_cap']
         score_source = f'selector:{chosen_branch}, regime={selector_info["regime"]}'
     else:
-        filtered = select_candidates(score_df, post_cfg)
+        filtered = select_candidates(
+            score_df,
+            post_cfg,
+            history_df=raw_df,
+            asof_date=latest_date,
+        )
         breadth = artifacts['breadth']
         if 'exposure_cap' in post_cfg:
             exposure_cap = float(post_cfg['exposure_cap'])
@@ -2549,6 +2625,7 @@ def main():
         print(f'[BDC][selector] chosen_branch={selector_info["chosen_branch"]}')
     print(f'[BDC][predict] exposure={output_df["weight"].sum():.4f}')
     print(f'[BDC][predict] output={output_path}')
+    print(f'[BDC][predict] selected={",".join(output_df["stock_id"].astype(str).tolist())}')
 
 
 if __name__ == '__main__':
