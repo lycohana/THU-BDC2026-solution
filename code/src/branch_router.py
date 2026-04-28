@@ -106,10 +106,11 @@ DEFAULT_BRANCH_ROUTER_V2B_CONFIG = {
     "liquidity_min_rank": 0.05,
     "supplemental_overlay_enabled": True,
     "supplemental_overlay_shadow_only": False,
-    "supplemental_overlay_name": "riskoff_rank4_dynamic_cooldown_minrisk_v1",
+    "supplemental_overlay_name": "riskoff_rank4_dynamic_growth_rrf_v1",
     "supplemental_overlay_max_swaps": 1,
     "supplemental_overlay_priority": [
         "deep_rebound_repair",
+        "growth_rrf_repair",
         "riskoff_fill_rank4_dynamic_defensive_target_no_v2b_swap",
         "pullback_rebound_highest_risk",
         "cooldown_minrisk_repair",
@@ -148,6 +149,7 @@ DEFAULT_BRANCH_ROUTER_V2B_CONFIG = {
     "deep_rebound_ret20_max": 0.30,
     "deep_rebound_amp20_min": 0.05,
     "deep_rebound_sigma20_max": 0.060,
+    "growth_rrf_repair_enabled": True,
     "cooldown_minrisk_enabled": True,
     "cooldown_minrisk_cold_median_ret20_min": -0.015,
     "cooldown_minrisk_cold_median_ret20_max": 0.020,
@@ -177,6 +179,7 @@ DEFAULT_BRANCH_ROUTER_V2B_CONFIG = {
     "anti_lottery_dbeta_guard_max": 1.35,
     "supplemental_overlay_experimental_priority": [
         "deep_rebound_repair",
+        "growth_rrf_repair",
         "riskoff_fill_rank4_dynamic_defensive_target_no_v2b_swap",
         "pullback_rebound_highest_risk",
         "cooldown_minrisk_repair",

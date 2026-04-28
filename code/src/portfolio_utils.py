@@ -553,6 +553,260 @@ def _apply_cooldown_minrisk_overlay(score_df, selected, cfg):
     }
 
 
+def _growth_repair_frame(score_df):
+    out = score_df.copy()
+    out['stock_id'] = out['stock_id'].map(normalize_stock_id)
+    for col in [
+        'score',
+        'transformer',
+        'lgb',
+        'ret1',
+        'ret5',
+        'ret20',
+        'sigma20',
+        'amp20',
+        'downside_beta60',
+        'max_drawdown20',
+        'median_amount20',
+    ]:
+        out[col] = _num_col(out, col)
+    out['tf_rank'] = _rank_pct(out['transformer'])
+    out['score_rank'] = _rank_pct(out['score'])
+    out['lgb_rank'] = _rank_pct(out['lgb'])
+    out['liq_rank'] = _rank_pct(out['median_amount20'])
+    out['ret20_rank'] = _rank_pct(out['ret20'])
+    out['ret5_rank'] = _rank_pct(out['ret5'])
+    out['ret1_rank'] = _rank_pct(out['ret1'])
+    out['sigma_rank'] = _rank_pct(out['sigma20'])
+    out['amp_rank'] = _rank_pct(out['amp20'])
+    out['dbeta_rank'] = _rank_pct(out['downside_beta60'])
+    out['drawdown_rank'] = _rank_pct(out['max_drawdown20'])
+    out['growth_hybrid_score'] = 0.40 * out['tf_rank'] + 0.40 * out['score_rank'] + 0.20 * out['lgb_rank']
+    out['growth_safe_score'] = (
+        0.34 * out['tf_rank']
+        + 0.26 * out['score_rank']
+        + 0.18 * out['lgb_rank']
+        + 0.12 * out['ret20_rank']
+        + 0.06 * out['ret5_rank']
+        + 0.04 * out['liq_rank']
+        - 0.06 * out['sigma_rank']
+        - 0.04 * out['amp_rank']
+        - 0.04 * out['drawdown_rank']
+    )
+    out['growth_cold_alpha_score'] = (
+        0.70 * out['ret20_rank']
+        + 0.12 * out['tf_rank']
+        + 0.06 * out['lgb_rank']
+        + 0.06 * out['liq_rank']
+        + 0.03 * out['score_rank']
+        - 0.04 * out['sigma_rank']
+        - 0.03 * out['amp_rank']
+        - 0.03 * out['drawdown_rank']
+    )
+    tail_risk_score = (
+        0.20 * out['sigma_rank']
+        + 0.20 * out['amp_rank']
+        + 0.25 * out['dbeta_rank']
+        + 0.35 * out['drawdown_rank']
+    )
+    uncertainty_score = 0.50 * (out['lgb_rank'] - out['tf_rank']).abs() + 0.25
+    overheat = ((out['ret5_rank'] > 0.75) & (out['amp_rank'] > 0.75)).astype(float) * (
+        0.35 * out['ret5_rank'] + 0.25 * out['amp_rank'] + 0.20
+    )
+
+    source_cols = [('transformer', 1.0), ('score', 0.6), ('lgb', 0.6)]
+    candidate_ids = set()
+    rrf = pd.Series(0.0, index=out.index, dtype=np.float64)
+    for col, weight in source_cols:
+        candidate_ids.update(out.nlargest(min(10, len(out)), col)['stock_id'].astype(str).tolist())
+        ranks = out[col].rank(method='min', ascending=False)
+        rrf = rrf + weight / (30.0 + ranks)
+    out['growth_rrf_raw'] = rrf
+    out['growth_tail_risk_score'] = tail_risk_score
+    out['growth_uncertainty_score'] = uncertainty_score
+    out['growth_overheat_score'] = overheat
+    out['growth_rrf_score'] = 0.0
+    out['growth_rrf_pool'] = out['stock_id'].astype(str).isin(candidate_ids)
+    return out
+
+
+def _growth_repair_state(score_df):
+    out = _growth_repair_frame(score_df)
+    ret20 = _num_col(out, 'ret20')
+    ret5 = _num_col(out, 'ret5')
+    ret1 = _num_col(out, 'ret1')
+    sigma20 = _num_col(out, 'sigma20')
+    top20 = out.sort_values('growth_hybrid_score', ascending=False).head(20)
+    growth_prefix = (
+        top20['stock_id'].astype(str).str.startswith('300')
+        | top20['stock_id'].astype(str).str.startswith('002')
+        | top20['stock_id'].astype(str).str.startswith('688')
+    )
+    stats = {
+        'median_ret20': float(ret20.median()),
+        'breadth20': float((ret20 > 0).mean()),
+        'median_ret5': float(ret5.median()),
+        'breadth5': float((ret5 > 0).mean()),
+        'median_ret1': float(ret1.median()),
+        'breadth1': float((ret1 > 0).mean()),
+        'dispersion20': float(ret20.quantile(0.90) - ret20.quantile(0.10)),
+        'median_sigma20': float(sigma20.median()),
+        'top20_growth_ret20': float(_num_col(top20, 'ret20').mean()),
+        'top20_growth_share': float(growth_prefix.mean()) if len(top20) else 0.0,
+        'top20_chinext_share': float(top20['stock_id'].astype(str).str.startswith('300').mean()) if len(top20) else 0.0,
+    }
+    return out, stats
+
+
+def _growth_repair_mode(stats):
+    med1 = stats['median_ret1']
+    med20 = stats['median_ret20']
+    br20 = stats['breadth20']
+    br5 = stats['breadth5']
+    br1 = stats['breadth1']
+    disp20 = stats['dispersion20']
+    sig = stats['median_sigma20']
+    top_ret20 = stats['top20_growth_ret20']
+    top_growth = stats['top20_growth_share']
+    top_300 = stats['top20_chinext_share']
+
+    cold_alpha = (
+        med20 >= 0.0
+        and med20 <= 0.02
+        and br20 >= 0.50
+        and br20 <= 0.58
+        and br5 >= 0.35
+        and br5 <= 0.50
+        and br1 >= 0.35
+        and br1 <= 0.48
+        and disp20 >= 0.27
+    )
+    if cold_alpha:
+        return 'cold_alpha'
+
+    cold_pullback_alpha = (
+        med20 >= 0.0
+        and med20 <= 0.02
+        and br20 >= 0.50
+        and br20 <= 0.60
+        and br5 >= 0.35
+        and br5 <= 0.50
+        and br1 < 0.35
+        and disp20 >= 0.20
+        and disp20 <= 0.27
+        and sig >= 0.018
+        and top_ret20 >= 0.10
+        and top_growth >= 0.25
+        and top_growth <= 0.45
+        and top_300 <= 0.20
+    )
+    if cold_pullback_alpha:
+        return 'cold_alpha'
+
+    if med1 <= 0.01:
+        if top_300 <= 0.23:
+            if br20 <= 0.29:
+                return 'hybrid' if sig <= 0.02 else ''
+            if top_ret20 <= 0.05:
+                if br20 <= 0.51:
+                    return 'safe'
+                if br20 <= 0.56:
+                    return 'rrf'
+                return 'safe' if med1 <= -0.01 else ''
+            if med20 <= 0.03:
+                return ''
+            return 'hybrid' if top_growth <= 0.57 else 'safe'
+
+        if top_ret20 <= -0.04:
+            return 'hybrid'
+        if disp20 <= 0.15:
+            return ''
+        if br5 <= 0.47:
+            if med1 < 0.0 and br1 < 0.30:
+                return ''
+            if br1 >= 0.70 and top_growth >= 0.70:
+                return 'hybrid'
+            if br1 <= 0.38:
+                return 'hybrid'
+            return 'safe' if br20 <= 0.51 else ''
+        if med1 <= 0.0:
+            return 'rrf'
+        if top_growth >= 0.45 and br1 >= 0.60 and med20 <= 0.015:
+            return 'hybrid'
+        if top_growth >= 0.75:
+            return 'rrf'
+        return 'hybrid' if disp20 <= 0.16 else 'safe'
+
+    if med20 <= -0.01:
+        return 'safe' if br20 <= 0.30 else 'rrf'
+    return 'hybrid'
+
+
+def _growth_repair_candidates(work, mode):
+    if mode == 'hybrid':
+        candidates = work.sort_values('growth_hybrid_score', ascending=False).copy()
+        score_col = 'growth_hybrid_score'
+    elif mode == 'rrf':
+        candidates = work[work['growth_rrf_pool'].astype(bool)].copy()
+        candidates['growth_rrf_score'] = (
+            0.45 * _rank_pct(candidates['growth_rrf_raw'])
+            + 0.15 * candidates['tf_rank']
+            + 0.10 * _rank_pct(candidates['lgb'])
+            - 0.25 * candidates['growth_tail_risk_score']
+            - 0.20 * candidates['growth_uncertainty_score']
+            - 0.10 * candidates['growth_overheat_score']
+        )
+        candidates = candidates.sort_values('growth_rrf_score', ascending=False)
+        score_col = 'growth_rrf_score'
+    elif mode == 'safe':
+        mask = (
+            (_num_col(work, 'ret20') >= -0.08)
+            & (_num_col(work, 'sigma20') <= 0.08)
+            & (_num_col(work, 'amp20') <= 0.55)
+        )
+        candidates = work[mask].sort_values('growth_safe_score', ascending=False).copy()
+        score_col = 'growth_safe_score'
+    elif mode == 'cold_alpha':
+        mask = (
+            (_num_col(work, 'ret20') >= 0.0)
+            & (_num_col(work, 'ret20') <= 0.35)
+            & (_num_col(work, 'ret5') >= -0.05)
+            & (_num_col(work, 'ret1') >= -0.025)
+            & (_num_col(work, 'sigma20') <= 0.045)
+            & (_num_col(work, 'amp20') <= 0.45)
+            & (_num_col(work, 'max_drawdown20') <= 0.04)
+        )
+        candidates = work[mask].sort_values('growth_cold_alpha_score', ascending=False).copy()
+        score_col = 'growth_cold_alpha_score'
+    else:
+        return pd.DataFrame(), ''
+    return candidates, score_col
+
+
+def _apply_growth_rrf_overlay(score_df, selected, cfg):
+    if not bool(cfg.get('growth_rrf_repair_enabled', True)):
+        return selected, None
+    work, stats = _growth_repair_state(score_df)
+    mode = _growth_repair_mode(stats)
+    if not mode:
+        return selected, {'accepted': False, 'overlay': 'growth_rrf_repair', 'growth_mode': '', **stats}
+    candidates, score_col = _growth_repair_candidates(work, mode)
+    if len(candidates) < 5:
+        return selected, {'accepted': False, 'overlay': 'growth_rrf_repair', 'growth_mode': mode, 'blocked_reason': 'not_enough_candidates', **stats}
+    current = _top5_frame(selected)
+    chosen = candidates.head(5).copy()
+    return _force_selected_top5(chosen, 'growth_rrf_repair'), {
+        'accepted': True,
+        'overlay': 'growth_rrf_repair',
+        'growth_mode': mode,
+        'candidate_stock': ','.join(chosen['stock_id'].astype(str).tolist()),
+        'replaced_stock': ','.join(current['stock_id'].astype(str).tolist()),
+        'candidate_score': float(_num_col(chosen, score_col).mean()),
+        'swap_count': 5,
+        **stats,
+    }
+
+
 def _deep_rebound_state(score_df, cfg):
     ret20 = _num_col(score_df, 'ret20')
     amp20 = _num_col(score_df, 'amp20')
@@ -887,6 +1141,8 @@ def apply_supplemental_overlay(score_df, selected, cfg=None):
             current, info = _apply_pullback_rebound_overlay(score_df, current, cfg)
         elif name == 'deep_rebound_repair':
             current, info = _apply_deep_rebound_overlay(score_df, current, cfg)
+        elif name == 'growth_rrf_repair':
+            current, info = _apply_growth_rrf_overlay(score_df, current, cfg)
         elif name == 'cooldown_minrisk_repair':
             current, info = _apply_cooldown_minrisk_overlay(score_df, current, cfg)
         elif name == 'ret5_guarded_booster':
@@ -903,7 +1159,7 @@ def apply_supplemental_overlay(score_df, selected, cfg=None):
     max_swaps = int(cfg.get('max_total_swaps', cfg.get('supplemental_overlay_max_swaps', 1)))
     accepted_count = sum(int(info.get('swap_count', 1)) for info in diagnostics if info.get('accepted'))
     skip_stress = any(
-        info.get('accepted') and info.get('overlay') in {'deep_rebound_repair', 'cooldown_minrisk_repair'}
+        info.get('accepted') and info.get('overlay') in {'deep_rebound_repair', 'growth_rrf_repair', 'cooldown_minrisk_repair'}
         for info in diagnostics
     )
     if not skip_stress:

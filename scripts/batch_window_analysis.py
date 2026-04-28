@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -942,6 +943,37 @@ def summarize_windows(summary: pd.DataFrame) -> dict:
     }
 
 
+def format_duration(seconds: float | None) -> str:
+    if seconds is None or seconds != seconds or seconds < 0:
+        return "--:--"
+    seconds = int(round(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def print_progress(done: int, total: int, started_at: float, last_anchor: pd.Timestamp | None = None) -> None:
+    total = max(int(total), 1)
+    done = min(max(int(done), 0), total)
+    elapsed = time.time() - started_at
+    ratio = done / total
+    width = 28
+    filled = int(round(width * ratio))
+    bar = "#" * filled + "-" * (width - filled)
+    eta = (elapsed / done * (total - done)) if done > 0 else None
+    last = f" last={last_anchor:%Y-%m-%d}" if last_anchor is not None else ""
+    sys.stdout.write(
+        "\r"
+        f"[batch][progress] |{bar}| {done:>3}/{total:<3} "
+        f"{ratio:>6.1%} elapsed={format_duration(elapsed)} eta={format_duration(eta)}{last}"
+    )
+    if done >= total:
+        sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw", default="data/train_hs300_20260424.csv")
@@ -962,6 +994,8 @@ def main() -> None:
         default=None,
         help="Number of anchors to run in parallel; default=min(4, anchors, cpu_count)",
     )
+    parser.add_argument("--no-progress", action="store_true", help="Disable the live progress bar")
+    parser.add_argument("--run-loo", action="store_true", help="Run the slow leave-one-out threshold search")
     args = parser.parse_args()
 
     raw_path = ROOT / args.raw
@@ -996,18 +1030,28 @@ def main() -> None:
         os.environ["BDC_FEATURE_WORKERS"] = str(safe_fw)
     print(f"[batch] feature_workers_per_predict={safe_fw}")
 
+    started_at = time.time()
+    completed = 0
+    progress_enabled = not args.no_progress
+    if progress_enabled:
+        print_progress(completed, len(anchors), started_at)
+
     if workers == 1:
-        results = [
-            analyze_anchor_window(
-                raw=raw,
-                anchor=anchor,
-                run_dir=run_dir,
-                model_dir=args.model_dir,
-                use_cache=not args.no_cache,
-                label_horizon=args.label_horizon,
+        results = []
+        for anchor in anchors:
+            results.append(
+                analyze_anchor_window(
+                    raw=raw,
+                    anchor=anchor,
+                    run_dir=run_dir,
+                    model_dir=args.model_dir,
+                    use_cache=not args.no_cache,
+                    label_horizon=args.label_horizon,
+                )
             )
-            for anchor in anchors
-        ]
+            completed += 1
+            if progress_enabled:
+                print_progress(completed, len(anchors), started_at, anchor)
     else:
         results = []
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -1029,6 +1073,9 @@ def main() -> None:
                     results.append(future.result())
                 except Exception as exc:
                     raise RuntimeError(f"anchor {anchor:%Y-%m-%d} failed") from exc
+                completed += 1
+                if progress_enabled:
+                    print_progress(completed, len(anchors), started_at, anchor)
 
         anchor_order = {anchor: idx for idx, anchor in enumerate(anchors)}
         results.sort(key=lambda item: anchor_order[item["anchor"]])
@@ -1094,7 +1141,8 @@ def main() -> None:
         guarded_selected.to_csv(run_dir / "guarded_selector_replay.csv", index=False)
 
     loo = pd.DataFrame()
-    if len(branches) and branches["anchor_date"].nunique() >= 2:
+    if args.run_loo and len(branches) and branches["anchor_date"].nunique() >= 2:
+        print("[batch] running LOO threshold search")
         loo = loo_threshold_search(branches)
         loo.to_csv(run_dir / "loo_threshold_search.csv", index=False)
 

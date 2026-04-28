@@ -311,6 +311,41 @@ def test_cooldown_minrisk_repair_preempts_ret5_chase_in_cold_pullback():
     assert not any(item.get("overlay") == "ret5_guarded_booster" and item.get("accepted") for item in info)
 
 
+def test_growth_rrf_repair_uses_hybrid_when_risk_appetite_improves():
+    cfg = _cfg()
+    cfg.update(
+        {
+            "stress_chaser_veto_enabled": False,
+            "supplemental_overlay_priority": ["growth_rrf_repair", "cooldown_minrisk_repair"],
+            "growth_rrf_repair_enabled": True,
+        }
+    )
+    rows = [
+        _row("000001", 0.10, lgb=0.1, ret1=0.012, ret5=0.02, ret20=0.02),
+        _row("000002", 0.09, lgb=0.1, ret1=0.012, ret5=0.02, ret20=0.02),
+        _row("000003", 0.08, lgb=0.1, ret1=0.012, ret5=0.02, ret20=0.02),
+        _row("000004", 0.07, lgb=0.1, ret1=0.012, ret5=0.02, ret20=0.02),
+        _row("000005", 0.06, lgb=0.1, ret1=0.012, ret5=0.02, ret20=0.02),
+        _row("300006", 1.00, lgb=1.4, ret1=0.015, ret5=0.03, ret20=0.04, amount=3_000_000_000),
+        _row("002007", 0.95, lgb=1.3, ret1=0.015, ret5=0.03, ret20=0.04, amount=2_900_000_000),
+        _row("688008", 0.90, lgb=1.2, ret1=0.015, ret5=0.03, ret20=0.04, amount=2_800_000_000),
+        _row("300009", 0.85, lgb=1.1, ret1=0.015, ret5=0.03, ret20=0.04, amount=2_700_000_000),
+        _row("002010", 0.80, lgb=1.0, ret1=0.015, ret5=0.03, ret20=0.04, amount=2_600_000_000),
+    ]
+    for i, row in enumerate(rows):
+        row["transformer"] = 0.1 if i < 5 else 1.5 - i * 0.02
+    score_df = pd.DataFrame(rows)
+    selected = score_df.iloc[:5].copy()
+
+    out = apply_supplemental_overlay(score_df, selected, cfg)
+    ids = out.head(5)["stock_id"].astype(str).tolist()
+
+    assert set(ids) == {"300006", "002007", "688008", "300009", "002010"}
+    info = out.attrs["supplemental_overlay_info"]
+    assert any(item.get("overlay") == "growth_rrf_repair" and item.get("accepted") for item in info)
+    assert not any(item.get("overlay") == "cooldown_minrisk_repair" and item.get("accepted") for item in info)
+
+
 def test_deep_rebound_repair_full_replaces_and_skips_later_overlays():
     cfg = _cfg()
     cfg.update(
