@@ -276,6 +276,41 @@ def test_ret5_guarded_booster_replaces_weak_short_term_names():
     )
 
 
+def test_cooldown_minrisk_repair_preempts_ret5_chase_in_cold_pullback():
+    cfg = _cfg()
+    cfg.update(
+        {
+            "stress_chaser_veto_enabled": False,
+            "supplemental_overlay_priority": ["cooldown_minrisk_repair", "ret5_guarded_booster"],
+            "cooldown_minrisk_enabled": True,
+        }
+    )
+    rows = [
+        _row("000001", 1.00, ret1=-0.02, ret5=-0.03, ret20=0.24, sigma20=0.070, amp20=0.40, downside_beta60=1.9, amount=800_000_000),
+        _row("000002", 0.95, ret1=-0.01, ret5=-0.02, ret20=0.12, sigma20=0.065, amp20=0.36, downside_beta60=1.8, amount=850_000_000),
+        _row("000003", 0.90, ret1=-0.02, ret5=-0.04, ret20=-0.10, sigma20=0.060, amp20=0.34, downside_beta60=1.7, amount=900_000_000),
+        _row("000004", 0.85, ret1=0.00, ret5=-0.01, ret20=-0.07, sigma20=0.058, amp20=0.32, downside_beta60=1.6, amount=950_000_000),
+        _row("000005", 0.80, ret1=0.00, ret5=0.01, ret20=0.01, sigma20=0.055, amp20=0.31, downside_beta60=1.5, amount=1_000_000_000),
+        _row("000006", 0.55, lgb=1.5, ret1=0.01, ret5=0.02, ret20=0.005, sigma20=0.012, amp20=0.05, downside_beta60=0.3, amount=4_000_000_000),
+        _row("000007", 0.50, lgb=1.4, ret1=0.01, ret5=0.01, ret20=-0.004, sigma20=0.013, amp20=0.05, downside_beta60=0.3, amount=3_800_000_000),
+        _row("000008", 0.45, lgb=1.3, ret1=0.00, ret5=-0.01, ret20=-0.006, sigma20=0.014, amp20=0.05, downside_beta60=0.4, amount=3_600_000_000),
+        _row("000009", 0.40, lgb=1.2, ret1=0.01, ret5=0.00, ret20=0.002, sigma20=0.015, amp20=0.06, downside_beta60=0.4, amount=3_400_000_000),
+        _row("000010", 0.35, lgb=1.1, ret1=0.01, ret5=-0.01, ret20=-0.003, sigma20=0.016, amp20=0.06, downside_beta60=0.5, amount=3_200_000_000),
+        _row("000011", 0.30, lgb=1.8, ret1=0.02, ret5=0.18, ret20=0.18, sigma20=0.025, amp20=0.20, downside_beta60=1.0, amount=5_000_000_000),
+    ]
+    score_df = pd.DataFrame(rows)
+    selected = score_df.iloc[:5].copy()
+
+    out = apply_supplemental_overlay(score_df, selected, cfg)
+    ids = out.head(5)["stock_id"].astype(str).tolist()
+
+    assert not set(ids) & {"000001", "000002", "000003", "000004", "000005"}
+    assert {"000006", "000007", "000008", "000009"}.issubset(set(ids))
+    info = out.attrs["supplemental_overlay_info"]
+    assert any(item.get("overlay") == "cooldown_minrisk_repair" and item.get("accepted") for item in info)
+    assert not any(item.get("overlay") == "ret5_guarded_booster" and item.get("accepted") for item in info)
+
+
 def test_deep_rebound_repair_full_replaces_and_skips_later_overlays():
     cfg = _cfg()
     cfg.update(

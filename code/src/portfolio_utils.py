@@ -479,6 +479,80 @@ def _apply_ret5_guarded_overlay(score_df, selected, cfg):
     }
 
 
+def _cooldown_minrisk_state(score_df, cfg):
+    ret20 = _num_col(score_df, 'ret20')
+    ret5 = _num_col(score_df, 'ret5')
+    ret1 = _num_col(score_df, 'ret1')
+    sigma20 = _num_col(score_df, 'sigma20')
+    stats = {
+        'median_ret20': float(ret20.median()),
+        'breadth20': float((ret20 > 0).mean()),
+        'breadth5': float((ret5 > 0).mean()),
+        'breadth1': float((ret1 > 0).mean()),
+        'median_sigma20': float(sigma20.median()),
+        'dispersion20': float(ret20.quantile(0.90) - ret20.quantile(0.10)),
+    }
+    cold_pullback = (
+        stats['median_ret20'] >= float(cfg.get('cooldown_minrisk_cold_median_ret20_min', -0.015))
+        and stats['median_ret20'] <= float(cfg.get('cooldown_minrisk_cold_median_ret20_max', 0.020))
+        and stats['breadth20'] <= float(cfg.get('cooldown_minrisk_cold_breadth20_max', 0.58))
+        and stats['breadth5'] <= float(cfg.get('cooldown_minrisk_cold_breadth5_max', 0.50))
+        and stats['dispersion20'] >= float(cfg.get('cooldown_minrisk_cold_dispersion20_min', 0.20))
+    )
+    weak_broad_rebound = (
+        stats['median_ret20'] >= float(cfg.get('cooldown_minrisk_rebound_median_ret20_min', -0.015))
+        and stats['median_ret20'] <= float(cfg.get('cooldown_minrisk_rebound_median_ret20_max', 0.0))
+        and stats['breadth20'] <= float(cfg.get('cooldown_minrisk_rebound_breadth20_max', 0.48))
+        and stats['breadth5'] >= float(cfg.get('cooldown_minrisk_rebound_breadth5_min', 0.55))
+        and stats['breadth1'] <= float(cfg.get('cooldown_minrisk_rebound_breadth1_max', 0.50))
+        and stats['dispersion20'] >= float(cfg.get('cooldown_minrisk_rebound_dispersion20_min', 0.22))
+    )
+    stats['cooldown_mode'] = 'cold_pullback' if cold_pullback else ('weak_broad_rebound' if weak_broad_rebound else '')
+    stats['cooldown_minrisk_triggered'] = bool(cold_pullback or weak_broad_rebound)
+    return stats
+
+
+def _cooldown_minrisk_candidates(score_df):
+    out = _add_runtime_minrisk_scores(score_df)
+    if 'score_legal_minrisk' not in out.columns:
+        out['score_legal_minrisk'] = (
+            0.35 * _num_col(out, 'tf_norm')
+            + 0.15 * _num_col(out, 'lgb_norm')
+            + 0.20 * out['liq_rank']
+            - 0.15 * out['sigma_rank']
+            - 0.10 * out['downside_beta60_rank']
+            - 0.10 * out['max_drawdown20_rank']
+            - 0.05 * out['amp_rank']
+        )
+    candidates = legal_minrisk_hardened_filter(out).copy()
+    if len(candidates) >= 5:
+        return candidates.sort_values('score_legal_minrisk', ascending=False)
+    return out.sort_values('score_legal_minrisk', ascending=False)
+
+
+def _apply_cooldown_minrisk_overlay(score_df, selected, cfg):
+    if not bool(cfg.get('cooldown_minrisk_enabled', True)):
+        return selected, None
+    stats = _cooldown_minrisk_state(score_df, cfg)
+    if not stats['cooldown_minrisk_triggered']:
+        return selected, {'accepted': False, 'overlay': 'cooldown_minrisk_repair', **stats}
+    candidates = _cooldown_minrisk_candidates(score_df)
+    if len(candidates) < 5:
+        return selected, {'accepted': False, 'overlay': 'cooldown_minrisk_repair', 'blocked_reason': 'not_enough_candidates', **stats}
+    current = _top5_frame(selected)
+    chosen = candidates.head(5).copy()
+    score_col = 'score_legal_minrisk' if 'score_legal_minrisk' in chosen.columns else 'runtime_minrisk_score'
+    return _force_selected_top5(chosen, 'cooldown_minrisk_repair'), {
+        'accepted': True,
+        'overlay': 'cooldown_minrisk_repair',
+        'candidate_stock': ','.join(chosen['stock_id'].astype(str).tolist()),
+        'replaced_stock': ','.join(current['stock_id'].astype(str).tolist()),
+        'candidate_score': float(_num_col(chosen, score_col).mean()),
+        'swap_count': 5,
+        **stats,
+    }
+
+
 def _deep_rebound_state(score_df, cfg):
     ret20 = _num_col(score_df, 'ret20')
     amp20 = _num_col(score_df, 'amp20')
@@ -813,6 +887,8 @@ def apply_supplemental_overlay(score_df, selected, cfg=None):
             current, info = _apply_pullback_rebound_overlay(score_df, current, cfg)
         elif name == 'deep_rebound_repair':
             current, info = _apply_deep_rebound_overlay(score_df, current, cfg)
+        elif name == 'cooldown_minrisk_repair':
+            current, info = _apply_cooldown_minrisk_overlay(score_df, current, cfg)
         elif name == 'ret5_guarded_booster':
             current, info = _apply_ret5_guarded_overlay(score_df, current, cfg)
         elif name == 'pullback_stable_booster':
@@ -827,7 +903,7 @@ def apply_supplemental_overlay(score_df, selected, cfg=None):
     max_swaps = int(cfg.get('max_total_swaps', cfg.get('supplemental_overlay_max_swaps', 1)))
     accepted_count = sum(int(info.get('swap_count', 1)) for info in diagnostics if info.get('accepted'))
     skip_stress = any(
-        info.get('accepted') and info.get('overlay') == 'deep_rebound_repair'
+        info.get('accepted') and info.get('overlay') in {'deep_rebound_repair', 'cooldown_minrisk_repair'}
         for info in diagnostics
     )
     if not skip_stress:
