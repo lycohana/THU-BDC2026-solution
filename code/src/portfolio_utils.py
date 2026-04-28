@@ -308,6 +308,362 @@ def _apply_pullback_rebound_overlay(score_df, selected, cfg):
     }
 
 
+def _pullback_stable_candidates(score_df, selected_ids, cfg):
+    out = score_df.copy()
+    out['stock_id'] = out['stock_id'].map(normalize_stock_id)
+    if out.empty:
+        return out
+
+    ret5 = _num_col(out, 'ret5')
+    ret20 = _num_col(out, 'ret20')
+    intraday_ret = _num_col(out, 'intraday_ret', default=0.0)
+    sigma20 = _num_col(out, 'sigma20')
+    amp20 = _num_col(out, 'amp20')
+    drawdown20 = _num_col(out, 'max_drawdown20')
+    downside_beta60 = _num_col(out, 'downside_beta60')
+    lgb = _num_col(out, 'lgb')
+    model = _model_score(out)
+    risk = _risk_value_frame(out)
+
+    out['model_score'] = model
+    out['model_rank'] = _rank_pct(model)
+    out['lgb_rank'] = _rank_pct(lgb)
+    out['liquidity_rank'] = _rank_pct(_num_col(out, 'median_amount20'))
+    out['ret5_rank'] = _rank_pct(ret5)
+    out['ret20_rank'] = _rank_pct(ret20)
+    out['intraday_rank'] = _rank_pct(intraday_ret)
+    out['sigma_rank'] = _rank_pct(sigma20)
+    out['amp_rank'] = _rank_pct(amp20)
+    out['risk_rank'] = _rank_pct(risk)
+    out['dbeta_rank'] = _rank_pct(downside_beta60)
+    out['pullback_stable_score'] = (
+        0.35 * (1.0 - out['ret5_rank'])
+        + 0.25 * out['ret20_rank']
+        + 0.20 * out['intraday_rank']
+        + 0.15 * out['lgb_rank']
+        + 0.10 * out['liquidity_rank']
+        + 0.05 * out['model_rank']
+        - 0.15 * out['sigma_rank']
+        - 0.10 * out['amp_rank']
+    )
+    mask = (
+        (out['liquidity_rank'] >= float(cfg.get('pullback_stable_liquidity_rank_min', 0.20)))
+        & (ret20 >= float(cfg.get('pullback_stable_ret20_min', 0.0)))
+        & (ret20 <= float(cfg.get('pullback_stable_ret20_max', 0.35)))
+        & (out['sigma_rank'] <= float(cfg.get('pullback_stable_sigma_rank_max', 0.85)))
+        & (out['amp_rank'] <= float(cfg.get('pullback_stable_amp_rank_max', 0.90)))
+        & (out['dbeta_rank'] <= float(cfg.get('pullback_stable_dbeta_rank_max', 0.90)))
+        & (drawdown20 <= float(cfg.get('pullback_stable_drawdown_max', 0.16)))
+        & (
+            (out['lgb_rank'] >= float(cfg.get('pullback_stable_lgb_rank_min', 0.50)))
+            | (out['model_rank'] >= float(cfg.get('pullback_stable_model_rank_min', 0.45)))
+        )
+    )
+    selected_ids = {str(x) for x in selected_ids}
+    candidates = out[mask & ~out['stock_id'].astype(str).isin(selected_ids)].sort_values('pullback_stable_score', ascending=False).copy()
+    candidates['candidate_rank'] = np.arange(1, len(candidates) + 1)
+    rank_cap = int(cfg.get('pullback_stable_rank_cap', 1))
+    candidates = candidates[candidates['candidate_rank'] <= rank_cap].copy()
+    candidates['candidate_score'] = candidates['pullback_stable_score']
+    return candidates
+
+
+def _apply_pullback_stable_overlay(score_df, selected, cfg):
+    top5 = _top5_frame(selected)
+    if len(top5) < 5:
+        return selected, None
+    candidates = _pullback_stable_candidates(score_df, top5['stock_id'].astype(str).tolist(), cfg)
+    if candidates.empty:
+        return selected, {'accepted': False, 'overlay': 'pullback_stable_booster', 'blocked_reason': 'no_candidate'}
+
+    candidate = candidates.iloc[0]
+    target = _risk_target_row(top5, 'highest_risk')
+    candidate_risk = float(_risk_value_frame(candidate.to_frame().T).iloc[0])
+    target_risk = float(target.get('_risk_value', _risk_value_frame(target.to_frame().T).iloc[0]))
+    risk_delta = candidate_risk - target_risk
+    if risk_delta > float(cfg.get('pullback_stable_risk_delta_cap', 0.12)):
+        return selected, {
+            'accepted': False,
+            'overlay': 'pullback_stable_booster',
+            'blocked_reason': 'risk_delta_cap',
+            'candidate_stock': str(candidate['stock_id']),
+            'replaced_stock': str(target['stock_id']),
+            'risk_delta': risk_delta,
+        }
+
+    final = top5[top5['stock_id'] != target['stock_id']].copy()
+    final = pd.concat([final, candidate.to_frame().T], ignore_index=True).head(5)
+    return _force_selected_top5(final, 'pullback_stable_booster'), {
+        'accepted': True,
+        'overlay': 'pullback_stable_booster',
+        'candidate_stock': str(candidate['stock_id']),
+        'replaced_stock': str(target['stock_id']),
+        'candidate_rank': int(candidate['candidate_rank']),
+        'candidate_score': float(candidate['candidate_score']),
+        'risk_delta': risk_delta,
+    }
+
+
+def _ret5_guarded_candidates(score_df, selected_ids, cfg):
+    out = score_df.copy()
+    out['stock_id'] = out['stock_id'].map(normalize_stock_id)
+    if out.empty:
+        return out
+
+    ret5 = _num_col(out, 'ret5')
+    ret20 = _num_col(out, 'ret20')
+    sigma20 = _num_col(out, 'sigma20')
+    amp20 = _num_col(out, 'amp20')
+    drawdown20 = _num_col(out, 'max_drawdown20')
+    downside_beta60 = _num_col(out, 'downside_beta60')
+    lgb = _num_col(out, 'lgb')
+
+    out['liquidity_rank'] = _rank_pct(_num_col(out, 'median_amount20'))
+    out['lgb_rank'] = _rank_pct(lgb)
+    out['ret5_rank'] = _rank_pct(ret5)
+    out['sigma_rank'] = _rank_pct(sigma20)
+    out['amp_rank'] = _rank_pct(amp20)
+    out['dbeta_rank'] = _rank_pct(downside_beta60)
+    out['ret5_guarded_score'] = (
+        0.85 * out['ret5_rank']
+        + 0.05 * out['lgb_rank']
+        + 0.05 * out['liquidity_rank']
+        - 0.03 * out['sigma_rank']
+        - 0.03 * out['amp_rank']
+    )
+    mask = (
+        (ret5 >= float(cfg.get('ret5_guarded_ret5_min', 0.08)))
+        & (ret20 >= float(cfg.get('ret5_guarded_ret20_min', 0.08)))
+        & (ret20 <= float(cfg.get('ret5_guarded_ret20_max', 0.45)))
+        & (sigma20 <= float(cfg.get('ret5_guarded_sigma20_max', 0.050)))
+        & (amp20 <= float(cfg.get('ret5_guarded_amp20_max', 0.30)))
+        & (drawdown20 <= float(cfg.get('ret5_guarded_drawdown_max', 0.16)))
+        & (downside_beta60 <= float(cfg.get('ret5_guarded_downside_beta_max', 1.50)))
+        & (out['liquidity_rank'] >= float(cfg.get('ret5_guarded_liquidity_rank_min', 0.20)))
+        & (out['lgb_rank'] >= float(cfg.get('ret5_guarded_lgb_rank_min', 0.45)))
+    )
+    selected_ids = {str(x) for x in selected_ids}
+    candidates = out[mask & ~out['stock_id'].astype(str).isin(selected_ids)].sort_values('ret5_guarded_score', ascending=False).copy()
+    candidates['candidate_rank'] = np.arange(1, len(candidates) + 1)
+    rank_cap = int(cfg.get('ret5_guarded_rank_cap', 3))
+    candidates = candidates[candidates['candidate_rank'] <= rank_cap].copy()
+    candidates['candidate_score'] = candidates['ret5_guarded_score']
+    return candidates
+
+
+def _apply_ret5_guarded_overlay(score_df, selected, cfg):
+    top5 = _top5_frame(selected)
+    if len(top5) < 5:
+        return selected, None
+    max_swaps = int(cfg.get('ret5_guarded_max_swaps', 3))
+    if max_swaps <= 0:
+        return selected, None
+    candidates = _ret5_guarded_candidates(score_df, top5['stock_id'].astype(str).tolist(), cfg)
+    if candidates.empty:
+        return selected, {'accepted': False, 'overlay': 'ret5_guarded_booster', 'blocked_reason': 'no_candidate'}
+
+    target_order = top5.sort_values(['ret5', 'score'], ascending=[True, True]).copy()
+    swap_count = min(max_swaps, len(candidates), len(target_order))
+    targets = target_order.head(swap_count)
+    chosen = candidates.head(swap_count)
+    final = top5[~top5['stock_id'].astype(str).isin(set(targets['stock_id'].astype(str)))].copy()
+    final = pd.concat([final, chosen], ignore_index=True).head(5)
+    return _force_selected_top5(final, 'ret5_guarded_booster'), {
+        'accepted': True,
+        'overlay': 'ret5_guarded_booster',
+        'candidate_stock': ','.join(chosen['stock_id'].astype(str).tolist()),
+        'replaced_stock': ','.join(targets['stock_id'].astype(str).tolist()),
+        'candidate_rank': ','.join(chosen['candidate_rank'].astype(int).astype(str).tolist()),
+        'candidate_score': float(chosen['candidate_score'].mean()),
+        'swap_count': int(swap_count),
+    }
+
+
+def _deep_rebound_state(score_df, cfg):
+    ret20 = _num_col(score_df, 'ret20')
+    amp20 = _num_col(score_df, 'amp20')
+    stats = {
+        'median_ret20': float(ret20.median()),
+        'breadth20': float((ret20 > 0).mean()),
+        'median_amp20': float(amp20.median()),
+    }
+    stats['deep_rebound_triggered'] = bool(
+        stats['median_ret20'] <= float(cfg.get('deep_rebound_median_ret20_max', -0.055))
+        and stats['breadth20'] <= float(cfg.get('deep_rebound_breadth20_max', 0.30))
+        and stats['median_amp20'] >= float(cfg.get('deep_rebound_median_amp20_min', 0.16))
+    )
+    return stats
+
+
+def _deep_rebound_candidates(score_df, cfg):
+    out = score_df.copy()
+    out['stock_id'] = out['stock_id'].map(normalize_stock_id)
+    if out.empty:
+        return out
+
+    ret20 = _num_col(out, 'ret20')
+    amp20 = _num_col(out, 'amp20')
+    sigma20 = _num_col(out, 'sigma20')
+    out['tf_rank'] = _rank_pct(_num_col(out, 'transformer', default=0.0))
+    out['lgb_rank'] = _rank_pct(_num_col(out, 'lgb'))
+    out['ret20_rank'] = _rank_pct(ret20)
+    out['amp_rank'] = _rank_pct(amp20)
+    out['deep_rebound_score'] = (
+        1.00 * out['tf_rank']
+        + 0.05 * out['lgb_rank']
+        + 0.15 * out['ret20_rank']
+        + 0.05 * out['amp_rank']
+    )
+    mask = (
+        (ret20 <= float(cfg.get('deep_rebound_ret20_max', 0.30)))
+        & (amp20 >= float(cfg.get('deep_rebound_amp20_min', 0.05)))
+        & (sigma20 <= float(cfg.get('deep_rebound_sigma20_max', 0.060)))
+    )
+    candidates = out[mask].sort_values('deep_rebound_score', ascending=False).head(5).copy()
+    candidates['candidate_rank'] = np.arange(1, len(candidates) + 1)
+    candidates['candidate_score'] = candidates['deep_rebound_score']
+    return candidates
+
+
+def _apply_deep_rebound_overlay(score_df, selected, cfg):
+    stats = _deep_rebound_state(score_df, cfg)
+    if not stats['deep_rebound_triggered']:
+        return selected, {'accepted': False, 'overlay': 'deep_rebound_repair', **stats}
+    candidates = _deep_rebound_candidates(score_df, cfg)
+    if len(candidates) < 5:
+        return selected, {'accepted': False, 'overlay': 'deep_rebound_repair', 'blocked_reason': 'not_enough_candidates', **stats}
+    current = _top5_frame(selected)
+    return _force_selected_top5(candidates.head(5), 'deep_rebound_repair'), {
+        'accepted': True,
+        'overlay': 'deep_rebound_repair',
+        'candidate_stock': ','.join(candidates['stock_id'].astype(str).head(5).tolist()),
+        'replaced_stock': ','.join(current['stock_id'].astype(str).head(5).tolist()),
+        'candidate_rank': ','.join(candidates['candidate_rank'].astype(int).astype(str).head(5).tolist()),
+        'candidate_score': float(candidates['candidate_score'].head(5).mean()),
+        'swap_count': 5,
+        **stats,
+    }
+
+
+def _model_score(frame):
+    if 'grr_final_score' in frame.columns:
+        return _num_col(frame, 'grr_final_score')
+    return _num_col(frame, 'score')
+
+
+def _add_runtime_anti_lottery_scores(score_df):
+    out = score_df.copy()
+    out['stock_id'] = out['stock_id'].map(normalize_stock_id)
+    ret5 = _num_col(out, 'ret5')
+    ret20 = _num_col(out, 'ret20')
+    sigma20 = _num_col(out, 'sigma20')
+    amp20 = _num_col(out, 'amp20')
+    drawdown20 = _num_col(out, 'max_drawdown20')
+    downside_beta60 = _num_col(out, 'downside_beta60')
+    risk = _risk_value_frame(out)
+    max_ret20 = _num_col(out, 'max_ret20_raw')
+    max_jump20 = _num_col(out, 'max_high_jump20')
+
+    out['model_score'] = _model_score(out)
+    out['model_rank'] = _rank_pct(out['model_score'])
+    out['liquidity_rank'] = _rank_pct(_num_col(out, 'median_amount20'))
+    out['risk_rank'] = _rank_pct(risk)
+    out['max_ret_rank'] = _rank_pct(max_ret20)
+    out['max_jump_rank'] = _rank_pct(max_jump20)
+    out['anti_lottery_score'] = (
+        0.35 * out['model_rank']
+        + 0.20 * out['liquidity_rank']
+        + 0.20 * (1.0 - out['max_ret_rank'])
+        + 0.15 * (1.0 - out['max_jump_rank'])
+        - 0.15 * out['risk_rank']
+    )
+    out['pass_anti_lottery'] = (
+        (out['liquidity_rank'] >= 0.30)
+        & (out['model_rank'] >= 0.70)
+        & (sigma20 < 0.050)
+        & (amp20 < 0.10)
+        & (drawdown20 > -0.13)
+        & (downside_beta60 < 1.40)
+        & (out['max_ret_rank'] <= 0.55)
+        & (out['max_jump_rank'] <= 0.60)
+        & (ret5 > -0.04)
+        & (ret20 < 0.25)
+    )
+    return out
+
+
+def _anti_lottery_candidates(score_df, selected_ids, cfg):
+    out = _add_runtime_anti_lottery_scores(score_df)
+    selected_ids = {str(x) for x in selected_ids}
+    candidates = out[
+        ~out['stock_id'].astype(str).isin(selected_ids)
+        & out['pass_anti_lottery'].astype(bool)
+    ].copy()
+    if candidates.empty:
+        return candidates
+    candidates = candidates.sort_values('anti_lottery_score', ascending=False).copy()
+    candidates['candidate_rank'] = np.arange(1, len(candidates) + 1)
+    rank_cap = int(cfg.get('anti_lottery_rank_cap', 1))
+    candidates = candidates[candidates['candidate_rank'] <= rank_cap].copy()
+    candidates['candidate_score'] = candidates['anti_lottery_score']
+    return candidates
+
+
+def _anti_lottery_target(top5):
+    work = top5.copy()
+    work['_risk_value'] = _risk_value_frame(work)
+    work['_model_score'] = _model_score(work)
+    return work.sort_values(['_model_score', '_risk_value'], ascending=[True, False]).iloc[0]
+
+
+def _apply_conditional_anti_lottery_overlay(score_df, selected, cfg):
+    if not bool(cfg.get('anti_lottery_overlay_enabled', False)):
+        return selected, None
+    top5 = _top5_frame(selected)
+    if len(top5) < 5:
+        return selected, None
+    target = _anti_lottery_target(top5)
+    dbeta_guard = float(cfg.get('anti_lottery_dbeta_guard_max', 1.35))
+    target_dbeta = float(pd.to_numeric(target.get('downside_beta60', 0.0), errors='coerce'))
+    if target_dbeta > dbeta_guard:
+        return selected, {
+            'accepted': False,
+            'overlay': 'conditional_anti_lottery_dbeta_guard',
+            'blocked_reason': 'target_dbeta_guard',
+            'replaced_stock': str(target['stock_id']),
+            'target_downside_beta60': target_dbeta,
+            'guard_max': dbeta_guard,
+        }
+
+    selected_ids = set(top5['stock_id'].astype(str))
+    candidates = _anti_lottery_candidates(score_df, selected_ids, cfg)
+    target_score = float(target.get('_model_score', 0.0))
+    if not candidates.empty:
+        candidates = candidates[candidates['model_score'] > target_score].copy()
+    if candidates.empty:
+        return selected, {
+            'accepted': False,
+            'overlay': 'conditional_anti_lottery_dbeta_guard',
+            'blocked_reason': 'no_candidate',
+            'replaced_stock': str(target['stock_id']),
+            'target_model_score': target_score,
+        }
+
+    candidate = candidates.iloc[0]
+    final = top5[top5['stock_id'] != target['stock_id']].copy()
+    final = pd.concat([final, candidate.to_frame().T], ignore_index=True).head(5)
+    return _force_selected_top5(final, 'conditional_anti_lottery_dbeta_guard'), {
+        'accepted': True,
+        'overlay': 'conditional_anti_lottery_dbeta_guard',
+        'candidate_stock': str(candidate['stock_id']),
+        'replaced_stock': str(target['stock_id']),
+        'candidate_rank': int(candidate['candidate_rank']),
+        'candidate_score': float(candidate['candidate_score']),
+        'target_model_score': target_score,
+        'target_downside_beta60': target_dbeta,
+    }
+
+
 def _stress_state(score_df, cfg):
     ret20 = _num_col(score_df, 'ret20')
     sigma20 = _num_col(score_df, 'sigma20')
@@ -455,6 +811,12 @@ def apply_supplemental_overlay(score_df, selected, cfg=None):
             current, info = _apply_riskoff_rank4_dynamic_overlay(score_df, current, cfg)
         elif name == 'pullback_rebound_highest_risk':
             current, info = _apply_pullback_rebound_overlay(score_df, current, cfg)
+        elif name == 'deep_rebound_repair':
+            current, info = _apply_deep_rebound_overlay(score_df, current, cfg)
+        elif name == 'ret5_guarded_booster':
+            current, info = _apply_ret5_guarded_overlay(score_df, current, cfg)
+        elif name == 'pullback_stable_booster':
+            current, info = _apply_pullback_stable_overlay(score_df, current, cfg)
         else:
             info = {'accepted': False, 'overlay': name, 'blocked_reason': 'unsupported'}
         if info:
@@ -462,9 +824,21 @@ def apply_supplemental_overlay(score_df, selected, cfg=None):
             if info.get('accepted'):
                 break
 
-    current, veto_info = _apply_stress_chaser_veto_overlay(score_df, current, cfg)
-    if veto_info:
-        diagnostics.append(veto_info)
+    max_swaps = int(cfg.get('max_total_swaps', cfg.get('supplemental_overlay_max_swaps', 1)))
+    accepted_count = sum(int(info.get('swap_count', 1)) for info in diagnostics if info.get('accepted'))
+    skip_stress = any(
+        info.get('accepted') and info.get('overlay') == 'deep_rebound_repair'
+        for info in diagnostics
+    )
+    if not skip_stress:
+        current, veto_info = _apply_stress_chaser_veto_overlay(score_df, current, cfg)
+        if veto_info:
+            diagnostics.append(veto_info)
+        accepted_count = sum(int(info.get('swap_count', 1)) for info in diagnostics if info.get('accepted'))
+    if accepted_count < max_swaps:
+        current, anti_lottery_info = _apply_conditional_anti_lottery_overlay(score_df, current, cfg)
+        if anti_lottery_info:
+            diagnostics.append(anti_lottery_info)
 
     current.attrs['supplemental_overlay_info'] = diagnostics
     accepted = [info for info in diagnostics if info.get('accepted')]

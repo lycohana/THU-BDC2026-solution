@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd \"C:\\\\Users\\\\lycohana\\\\Desktop\\\\code\\\\BDC\\\\THU-BDC2026-solution\" && uv run pytest test/ -x -q 2>&1 | tail -40)",
+      "Bash(export UV_CACHE_DIR='.uv-cache' && BDC_FEATURE_WORKERS=1 BDC_DISABLE_PREDICT_CACHE=1 uv run python app/code/src/test.py 2>&1 | tail -80)",
+      "Bash(export UV_CACHE_DIR='.uv-cache' && uv run python test/score_self.py 2>&1)",
+      "Bash(export UV_CACHE_DIR='.uv-cache' && uv run python scripts/microstructure_shadow.py --source-run temp/batch_window_analysis/grr_tail_guard_60win --detail-dir temp/branch_router_validation/v2b_guarded_longer_60win_60win --raw-path data/train_hs300_20260424.csv --out-dir temp/branch_router_validation/microstructure_shadow_60win 2>&1 | tail -40)",
+      "Bash(export UV_CACHE_DIR='.uv-cache' && uv run python -c \"\nimport pandas as pd\ns = pd.read_csv\\('temp/branch_router_validation/microstructure_shadow_60win/microstructure_summary.csv'\\)\nfor bucket in ['20win', '40win', '60win']:\n    sub = s[s['bucket']==bucket].sort_values\\('delta_mean', ascending=False\\).head\\(5\\)\n    print\\(f'\\\\n=== {bucket} top 5 by delta_mean ==='\\)\n    print\\(sub[['variant','delta_mean','delta_q10','delta_worst','negative_delta_count','accepted_swaps']].to_string\\(index=False\\)\\)\n\nprint\\('\\\\n=== PASS CHECK: variants with d20>0, d40>=0, d60>=0, q20>=0, q40>=0, q60>=0 ==='\\)\nmerged = s[s['bucket']=='20win'][['variant','delta_mean','delta_q10','negative_delta_count']].rename\\(\n    columns={'delta_mean':'d20','delta_q10':'q20','negative_delta_count':'neg20'}\\)\nm40 = s[s['bucket']=='40win'][['variant','delta_mean','delta_q10','negative_delta_count']].rename\\(\n    columns={'delta_mean':'d40','delta_q10':'q40','negative_delta_count':'neg40'}\\)\nm60 = s[s['bucket']=='60win'][['variant','delta_mean','delta_q10','negative_delta_count']].rename\\(\n    columns={'delta_mean':'d60','delta_q10':'q60','negative_delta_count':'neg60'}\\)\nmerged = merged.merge\\(m40, on='variant'\\).merge\\(m60, on='variant'\\)\npassed = merged[\\(merged['d20']>0\\) & \\(merged['d40']>=0\\) & \\(merged['d60']>=0\\) & \n                \\(merged['q20']>=0\\) & \\(merged['q40']>=0\\) & \\(merged['q60']>=0\\)]\nprint\\(f'Variants passing all checks: {len\\(passed\\)}'\\)\nif not passed.empty:\n    print\\(passed.to_string\\(index=False\\)\\)\nelse:\n    print\\('NO VARIANT PASSES ALL REQUIRED CHECKS'\\)\n\" 2>&1)",
+      "Bash(export UV_CACHE_DIR='.uv-cache' && uv run pytest test/ -x -q 2>&1 | tail -5)",
+      "Bash(export UV_CACHE_DIR='.uv-cache' && BDC_FEATURE_WORKERS=1 BDC_DISABLE_PREDICT_CACHE=1 uv run python app/code/src/test.py 2>&1 | tail -10)",
+      "Bash(export UV_CACHE_DIR='.uv-cache' && uv run python scripts/conditional_antilottery_shadow.py 2>&1)"
+    ]
+  }
+}

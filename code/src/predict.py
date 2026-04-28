@@ -21,7 +21,7 @@ from portfolio_utils import apply_supplemental_overlay, build_weight_portfolio, 
 from reranker import apply_grr_top5
 
 
-PREDICT_CACHE_VERSION = 4
+PREDICT_CACHE_VERSION = 6
 
 
 def _file_fingerprint(path):
@@ -2558,6 +2558,7 @@ def main():
         'ret5',
         'ret10',
         'ret20',
+        'intraday_ret',
         'amp20',
         'amp_mean10',
         'vol10',
@@ -2573,6 +2574,8 @@ def main():
         'downside_beta60',
         'idio_vol60',
         'max_drawdown20',
+        'max_ret20_raw',
+        'max_high_jump20',
     ]:
         score_df[col] = score_df[col].fillna(score_df[col].median() if score_df[col].notna().any() else 0.0)
 

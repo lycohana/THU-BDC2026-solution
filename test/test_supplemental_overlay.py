@@ -18,25 +18,35 @@ def _row(
     ret1=0.0,
     ret5=0.0,
     ret20=-0.04,
+    intraday_ret=0.0,
     sigma20=0.02,
     amp20=0.06,
     drawdown20=0.03,
     downside_beta60=0.2,
     amount=1_000_000_000,
+    grr_final_score=None,
+    max_ret20_raw=0.08,
+    max_high_jump20=0.10,
 ):
-    return {
+    row = {
         "stock_id": stock_id,
         "score": score,
         "lgb": lgb,
         "ret1": ret1,
         "ret5": ret5,
         "ret20": ret20,
+        "intraday_ret": intraday_ret,
         "sigma20": sigma20,
         "amp20": amp20,
         "max_drawdown20": drawdown20,
         "downside_beta60": downside_beta60,
         "median_amount20": amount,
+        "max_ret20_raw": max_ret20_raw,
+        "max_high_jump20": max_high_jump20,
     }
+    if grr_final_score is not None:
+        row["grr_final_score"] = grr_final_score
+    return row
 
 
 def _cfg():
@@ -117,3 +127,188 @@ def test_stress_chaser_veto_stays_idle_outside_stress_state():
 
     assert ids == ["000001", "000002", "000003", "000004", "000005"]
     assert not any(info.get("accepted") for info in out.attrs["supplemental_overlay_info"])
+
+
+def test_conditional_anti_lottery_replaces_low_score_non_beta_target():
+    cfg = _cfg()
+    cfg.update(
+        {
+            "stress_chaser_veto_enabled": False,
+            "anti_lottery_overlay_enabled": True,
+            "anti_lottery_rank_cap": 1,
+            "anti_lottery_dbeta_guard_max": 1.35,
+            "max_total_swaps": 2,
+        }
+    )
+    rows = [
+        _row("000001", 1.00, grr_final_score=1.00, ret20=0.04, max_ret20_raw=0.12, max_high_jump20=0.14),
+        _row("000002", 0.90, grr_final_score=0.90, ret20=0.03, max_ret20_raw=0.11, max_high_jump20=0.13),
+        _row("000003", 0.80, grr_final_score=0.80, ret20=0.02, max_ret20_raw=0.10, max_high_jump20=0.12),
+        _row("000004", 0.70, grr_final_score=0.70, ret20=0.01, max_ret20_raw=0.09, max_high_jump20=0.11),
+        _row("000005", 0.60, grr_final_score=0.10, ret20=0.00, downside_beta60=1.0, max_ret20_raw=0.08, max_high_jump20=0.10),
+        _row("000006", 0.55, grr_final_score=0.95, ret5=0.01, ret20=0.08, sigma20=0.015, amp20=0.05, downside_beta60=0.4, amount=3_000_000_000, max_ret20_raw=0.00, max_high_jump20=0.01),
+    ]
+    score_df = pd.DataFrame(rows)
+    selected = score_df.iloc[:5].copy()
+
+    out = apply_supplemental_overlay(score_df, selected, cfg)
+    ids = out.head(5)["stock_id"].astype(str).tolist()
+
+    assert "000005" not in ids
+    assert "000006" in ids
+    assert any(info.get("overlay") == "conditional_anti_lottery_dbeta_guard" and info.get("accepted") for info in out.attrs["supplemental_overlay_info"])
+
+
+def test_conditional_anti_lottery_protects_high_downside_beta_target():
+    cfg = _cfg()
+    cfg.update(
+        {
+            "stress_chaser_veto_enabled": False,
+            "anti_lottery_overlay_enabled": True,
+            "anti_lottery_rank_cap": 1,
+            "anti_lottery_dbeta_guard_max": 1.35,
+            "max_total_swaps": 2,
+        }
+    )
+    rows = [
+        _row("000001", 1.00, grr_final_score=1.00, ret20=0.04, max_ret20_raw=0.12, max_high_jump20=0.14),
+        _row("000002", 0.90, grr_final_score=0.90, ret20=0.03, max_ret20_raw=0.11, max_high_jump20=0.13),
+        _row("000003", 0.80, grr_final_score=0.80, ret20=0.02, max_ret20_raw=0.10, max_high_jump20=0.12),
+        _row("000004", 0.70, grr_final_score=0.70, ret20=0.01, max_ret20_raw=0.09, max_high_jump20=0.11),
+        _row("000005", 0.60, grr_final_score=0.10, ret20=0.00, downside_beta60=1.6, max_ret20_raw=0.08, max_high_jump20=0.10),
+        _row("000006", 0.55, grr_final_score=0.95, ret5=0.01, ret20=0.08, sigma20=0.015, amp20=0.05, downside_beta60=0.4, amount=3_000_000_000, max_ret20_raw=0.00, max_high_jump20=0.01),
+    ]
+    score_df = pd.DataFrame(rows)
+    selected = score_df.iloc[:5].copy()
+
+    out = apply_supplemental_overlay(score_df, selected, cfg)
+    ids = out.head(5)["stock_id"].astype(str).tolist()
+
+    assert ids == ["000001", "000002", "000003", "000004", "000005"]
+    assert any(
+        info.get("overlay") == "conditional_anti_lottery_dbeta_guard"
+        and info.get("blocked_reason") == "target_dbeta_guard"
+        for info in out.attrs["supplemental_overlay_info"]
+    )
+
+
+def test_pullback_stable_booster_replaces_highest_risk_name():
+    cfg = _cfg()
+    cfg.update(
+        {
+            "stress_chaser_veto_enabled": False,
+            "anti_lottery_overlay_enabled": False,
+            "supplemental_overlay_priority": ["pullback_stable_booster"],
+            "pullback_stable_rank_cap": 1,
+            "pullback_stable_lgb_rank_min": 0.50,
+        }
+    )
+    rows = [
+        _row("000001", 1.00, ret20=0.04, sigma20=0.020, amp20=0.06, downside_beta60=0.5),
+        _row("000002", 0.90, ret20=0.03, sigma20=0.021, amp20=0.07, downside_beta60=0.6),
+        _row("000003", 0.80, ret20=0.02, sigma20=0.024, amp20=0.08, downside_beta60=0.7),
+        _row("000004", 0.70, ret20=0.01, sigma20=0.022, amp20=0.08, downside_beta60=0.6),
+        _row("000005", 0.60, ret20=0.05, sigma20=0.060, amp20=0.16, downside_beta60=1.2),
+        _row(
+            "000006",
+            0.55,
+            lgb=1.2,
+            ret5=-0.01,
+            ret20=0.12,
+            intraday_ret=0.025,
+            sigma20=0.018,
+            amp20=0.07,
+            drawdown20=0.05,
+            downside_beta60=0.4,
+            amount=3_000_000_000,
+        ),
+    ]
+    score_df = pd.DataFrame(rows)
+    selected = score_df.iloc[:5].copy()
+
+    out = apply_supplemental_overlay(score_df, selected, cfg)
+    ids = out.head(5)["stock_id"].astype(str).tolist()
+
+    assert "000005" not in ids
+    assert "000006" in ids
+    assert any(info.get("overlay") == "pullback_stable_booster" and info.get("accepted") for info in out.attrs["supplemental_overlay_info"])
+
+
+def test_ret5_guarded_booster_replaces_weak_short_term_names():
+    cfg = _cfg()
+    cfg.update(
+        {
+            "stress_chaser_veto_enabled": False,
+            "anti_lottery_overlay_enabled": True,
+            "supplemental_overlay_priority": ["ret5_guarded_booster"],
+            "max_total_swaps": 3,
+            "ret5_guarded_max_swaps": 3,
+            "ret5_guarded_rank_cap": 3,
+        }
+    )
+    rows = [
+        _row("000001", 1.00, ret5=0.03, ret20=0.12, sigma20=0.020, amp20=0.06, downside_beta60=0.5),
+        _row("000002", 0.90, ret5=-0.01, ret20=0.03, sigma20=0.021, amp20=0.07, downside_beta60=0.6),
+        _row("000003", 0.80, ret5=0.10, ret20=0.20, sigma20=0.024, amp20=0.08, downside_beta60=0.7),
+        _row("000004", 0.70, ret5=-0.03, ret20=0.01, sigma20=0.022, amp20=0.08, downside_beta60=0.6),
+        _row("000005", 0.60, ret5=-0.04, ret20=-0.02, sigma20=0.026, amp20=0.09, downside_beta60=0.7),
+        _row("000006", 0.50, lgb=1.4, ret5=0.18, ret20=0.24, sigma20=0.030, amp20=0.25, drawdown20=0.08, downside_beta60=1.3, amount=3_000_000_000),
+        _row("000007", 0.40, lgb=1.1, ret5=0.16, ret20=0.26, sigma20=0.025, amp20=0.22, drawdown20=0.04, downside_beta60=1.2, amount=2_800_000_000),
+        _row("000008", 0.30, lgb=0.9, ret5=0.12, ret20=0.18, sigma20=0.021, amp20=0.18, drawdown20=0.03, downside_beta60=1.1, amount=2_600_000_000),
+        _row("000009", 0.20, lgb=1.5, ret5=0.20, ret20=0.70, sigma20=0.030, amp20=0.40, drawdown20=0.02, downside_beta60=1.1, amount=3_200_000_000),
+    ]
+    score_df = pd.DataFrame(rows)
+    selected = score_df.iloc[:5].copy()
+
+    out = apply_supplemental_overlay(score_df, selected, cfg)
+    ids = out.head(5)["stock_id"].astype(str).tolist()
+
+    assert {"000006", "000007", "000008"}.issubset(set(ids))
+    assert "000005" not in ids
+    assert "000004" not in ids
+    assert "000002" not in ids
+    assert "000009" not in ids
+    assert any(
+        info.get("overlay") == "ret5_guarded_booster"
+        and info.get("accepted")
+        and info.get("swap_count") == 3
+        for info in out.attrs["supplemental_overlay_info"]
+    )
+
+
+def test_deep_rebound_repair_full_replaces_and_skips_later_overlays():
+    cfg = _cfg()
+    cfg.update(
+        {
+            "supplemental_overlay_priority": ["deep_rebound_repair", "ret5_guarded_booster"],
+            "deep_rebound_median_ret20_max": -0.055,
+            "deep_rebound_breadth20_max": 0.30,
+            "deep_rebound_median_amp20_min": 0.16,
+            "anti_lottery_overlay_enabled": True,
+        }
+    )
+    rows = [
+        _row("000001", 1.0, ret20=-0.08, amp20=0.20, sigma20=0.02),
+        _row("000002", 0.9, ret20=-0.09, amp20=0.19, sigma20=0.02),
+        _row("000003", 0.8, ret20=-0.07, amp20=0.18, sigma20=0.02),
+        _row("000004", 0.7, ret20=-0.10, amp20=0.21, sigma20=0.02),
+        _row("000005", 0.6, ret20=-0.06, amp20=0.17, sigma20=0.02),
+        _row("000006", 0.5, lgb=0.4, ret20=-0.04, amp20=0.22, sigma20=0.02),
+        _row("000007", 0.4, lgb=0.3, ret20=-0.05, amp20=0.20, sigma20=0.02),
+        _row("000008", 0.3, lgb=0.2, ret20=-0.06, amp20=0.19, sigma20=0.02),
+        _row("000009", 0.2, lgb=0.1, ret20=-0.07, amp20=0.18, sigma20=0.02),
+        _row("000010", 0.1, lgb=0.0, ret20=-0.08, amp20=0.17, sigma20=0.02),
+    ]
+    for i, row in enumerate(rows):
+        row["transformer"] = i + 1
+    score_df = pd.DataFrame(rows)
+    selected = score_df.iloc[:5].copy()
+
+    out = apply_supplemental_overlay(score_df, selected, cfg)
+    ids = out.head(5)["stock_id"].astype(str).tolist()
+
+    assert ids == ["000010", "000009", "000008", "000007", "000006"]
+    info = out.attrs["supplemental_overlay_info"]
+    assert any(item.get("overlay") == "deep_rebound_repair" and item.get("accepted") and item.get("swap_count") == 5 for item in info)
+    assert not any(item.get("overlay") == "stress_chaser_veto" for item in info)
+    assert not any(item.get("overlay") == "conditional_anti_lottery_dbeta_guard" for item in info)

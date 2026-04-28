@@ -6,15 +6,17 @@
 
 当前冻结队列：
 
-`riskoff_rank4_dynamic_pullback_stress_veto_v2`
+`riskoff_rank4_dynamic_ret5guarded_stress_veto_antilottery_v1`
 
 运行原则：
 
 1. Base 仍然是 `v2b_guarded_candidate_with_deeper_veto_disp013` 产出的候选顺序。
 2. Alpha overlay 每天最多接受 1 次，优先级为：
-   `riskoff_fill_rank4_dynamic_defensive_target_no_v2b_swap -> pullback_rebound_highest_risk`
-3. Stress-chaser veto 是最后的风险修复，不算新 alpha sleeve；它只在市场 stress gate 触发后，最多替换 1 个高风险持仓。
-4. Runtime 决策只使用 T 日可见特征，禁止使用 scorer、future return、baseline 分支或窗口回测结果。
+   `riskoff_fill_rank4_dynamic_defensive_target_no_v2b_swap -> pullback_rebound_highest_risk -> ret5_guarded_booster`
+3. `ret5_guarded_booster` 是冲高 sleeve：最多替换 3 个短期最弱持仓，但候选必须先通过 `ret20`、`sigma20`、`amp20`、`downside_beta60`、`max_drawdown20` 和流动性硬约束。
+4. Stress-chaser veto 是最后的风险修复，不算新 alpha sleeve；它只在市场 stress gate 触发后，最多替换 1 个高风险持仓。
+5. Conditional anti-lottery 是 stress veto 后的轻量补充，只在总替换次数未达到 `max_total_swaps=2` 时尝试；被替换标的必须满足 `downside_beta60 <= 1.35`，避免误删 stress 中可能反弹的高下行 beta 股票。
+6. Runtime 决策只使用 T 日可见特征，禁止使用 scorer、future return、baseline 分支或窗口回测结果。
 
 ## Live Path
 
@@ -50,7 +52,18 @@
 - 只替换当前 Top5 内最高风险的一只。
 - 通过 `pullback_rank_cap` 限制激进程度。
 
-### 3. Stress-Chaser Veto Final
+### 3. Ret5 Guarded Booster
+
+用途：把本地高分来源从“裸追 5 日涨幅”改成“5 日强势 + 风控硬门槛”。它保留冲高能力，同时用波动、振幅、下行 beta、回撤和流动性过滤掉最不稳的强势票。
+
+触发边界：
+
+- 只在 riskoff 和 strict pullback 都未接受时生效。
+- 候选必须在 Top5 外，且 `ret5 >= 0.08`、`0.08 <= ret20 <= 0.45`、`sigma20 <= 0.050`、`amp20 <= 0.30`、`downside_beta60 <= 1.50`、`max_drawdown20 <= 0.16`。
+- 候选按 `ret5` 排名为主，`lgb` 和流动性只作轻量加分，高波动和高振幅作轻量扣分。
+- 最多替换当前 Top5 中 `ret5` 最弱的 3 只，并在诊断中记录 `swap_count`，避免后置 anti-lottery 再把刚换入的冲高篮子冲掉。
+
+### 4. Stress-Chaser Veto Final
 
 用途：在市场已经处于 stress 状态时，剔除 Top5 里的局部风险爆点，而不是寻找收益最高的新票。
 
@@ -71,6 +84,29 @@
 - 当前 Top5 以外。
 - 通过 runtime min-risk 打分。
 - 优先低 `sigma20`、低 `amp20`、低 `max_drawdown20`、低 `downside_beta60`，同时要求足够流动性。
+
+### 5. Pullback Stable Booster
+
+用途：保留为 shadow/实验补位；当前 runtime priority 不启用。它在原 `pullback_rebound` 没有候选时，给中期仍为正、短期不极端、T 日收盘强度确认、同时流动性和波动可控的票一次低优先级补位机会。
+
+触发边界：
+
+- 只在 riskoff 和 strict pullback 都未接受时生效。
+- 候选必须在 Top5 外，并通过 `ret20`、`intraday_ret`、`sigma20`、`amp20`、`downside_beta60`、`max_drawdown20` 和流动性约束。
+- 打分偏好低 `ret5` 排名、较高 `ret20` 排名、较高 `intraday_ret` 排名、较好 `lgb` 支持，同时惩罚高波动和高振幅。
+- 只替换当前 Top5 中最高风险的一只，并受 `pullback_stable_risk_delta_cap` 约束。
+
+### 6. Conditional Anti-Lottery
+
+用途：在 frozen queue 处理后，替换 Top5 中模型分最低、且并非高下行 beta 保护对象的“彩票型”弱票。
+
+触发边界：
+
+- 仅当当前累计 accepted swaps 少于 `max_total_swaps` 时尝试。
+- 替换目标按 `grr_final_score` 最低优先；若目标 `downside_beta60 > 1.35`，直接保护不换。
+- 候选必须在 Top5 外，模型排名不低于前 30%，流动性排名不低于前 70%，`sigma20 < 0.050`、`amp20 < 0.10`、`downside_beta60 < 1.40`。
+- 候选不能是近 20 日极端涨幅或高点跳升靠前的高彩票票：`max_ret_rank <= 0.55` 且 `max_jump_rank <= 0.60`。
+- 候选 `grr_final_score` 必须高于被替换目标。
 
 ## Frozen Evidence
 
@@ -125,6 +161,17 @@ uv run python scripts/post_guard_overlay_freeze.py
 2. Low liquidity-beta / downside-beta defensive：检查 stress veto 替换池是否可以加入 liquidity beta proxy。
 3. 52-week-high anchor + turnover：把追涨拆成“新闻型高换手动量”和“低锚定反转陷阱”两类。
 4. Conflict filter v2：逐日分析 riskoff / pullback / stress veto 与 v2b accepted swaps 的替换目标冲突。
+
+## Timing Leak Research Notes
+
+2026-04-28 追加研究了“业绩公告 + 高开阳线”类策略。关键结论：
+
+- 若策略在 `T` 日开盘买入，不能使用 `T` 日 `close > open` 作为筛选条件；这是同日未来函数。
+- 在当前日频框架里，`gap >= 3% 且 close > open` 只能在 `T` 日收盘后确认，因此最早只能按 `T+1` 开盘进入。
+- `scripts/post_announcement_reaction_shadow.py` 按这个无未来函数时点重测后，`gap_green_raw / sane / close_strong` 在 60win 事件研究中均为负均值、负 q10。
+- 将该信号作为 frozen queue 后置候选也会伤害 delta；反向 veto 没有触发，因为当前 frozen queue 基本没有持有这类过热形态。
+
+因此这类信号暂不接 runtime；只保留为未来公告数据接入时的时点校验模板。
 
 ## Post-Freeze Search Notes
 

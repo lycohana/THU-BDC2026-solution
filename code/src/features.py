@@ -16,6 +16,7 @@ HISTORY_FEATURE_COLUMNS = [
     'ret5',
     'ret10',
     'ret20',
+    'intraday_ret',
     'amp20',
     'pos20',
     'amt_ratio5',
@@ -24,6 +25,8 @@ HISTORY_FEATURE_COLUMNS = [
     'downside_beta60',
     'idio_vol60',
     'max_drawdown20',
+    'max_ret20_raw',
+    'max_high_jump20',
     'amount20',
     'return_1',
     'return_5',
@@ -57,6 +60,10 @@ def build_history_feature_frame(raw_df, asof_date=None, lookback=80):
 
     grouped = hist.groupby('股票代码', sort=False)
     hist['ret1'] = grouped['收盘'].pct_change(fill_method=None)
+    hist['intraday_ret'] = hist['收盘'] / (hist['开盘'] + 1e-12) - 1.0
+    prev_close = grouped['收盘'].shift(1)
+    hist['daily_ret_raw'] = hist['收盘'] / (prev_close + 1e-12) - 1.0
+    hist['high_jump'] = hist['最高'] / (prev_close + 1e-12) - 1.0
     hist['close_lag5'] = grouped['收盘'].shift(5)
     hist['close_lag10'] = grouped['收盘'].shift(10)
     hist['market_ret1'] = hist.groupby('日期', sort=False)['ret1'].transform('mean')
@@ -72,6 +79,8 @@ def build_history_feature_frame(raw_df, asof_date=None, lookback=80):
         first_close=('收盘', 'first'),
         max_high=('最高', 'max'),
         min_low=('最低', 'min'),
+        max_ret20_raw=('daily_ret_raw', 'max'),
+        max_high_jump20=('high_jump', 'max'),
         row_count=('收盘', 'size'),
     )
 
@@ -108,8 +117,11 @@ def build_history_feature_frame(raw_df, asof_date=None, lookback=80):
     risk['ret5'] = np.where(row_count >= 6, last_close / (close_lag5 + 1e-12) - 1.0, 0.0)
     risk['ret10'] = np.where(row_count >= 11, last_close / (close_lag10 + 1e-12) - 1.0, 0.0)
     risk['ret20'] = np.where(row_count >= 2, last_close / (first_close + 1e-12) - 1.0, 0.0)
+    risk['intraday_ret'] = latest['intraday_ret'].fillna(0.0).to_numpy(dtype=np.float64)
     risk['amp20'] = (high20 - low20) / (last_close + 1e-12)
     risk['pos20'] = (last_close - low20) / (high20 - low20 + 1e-12)
+    risk['max_ret20_raw'] = agg['max_ret20_raw'].fillna(0.0).to_numpy(dtype=np.float64)
+    risk['max_high_jump20'] = agg['max_high_jump20'].fillna(0.0).to_numpy(dtype=np.float64)
 
     amount5 = agg5.reindex(agg.index)['mean_amount5'].fillna(0.0).to_numpy(dtype=np.float64)
     turnover5 = agg5.reindex(agg.index)['turnover5'].fillna(0.0).to_numpy(dtype=np.float64)
