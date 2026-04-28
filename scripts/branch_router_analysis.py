@@ -33,6 +33,7 @@ from branch_router import (  # noqa: E402
     route_branch_v2a,
     route_branch_v2b_overlay,
 )
+from branch_router_diagnostics import aggregate_guard_summary, paired_delta_distribution, swap_delta_reconciliation  # noqa: E402
 from config import config as PROJECT_CONFIG  # noqa: E402
 from batch_window_analysis import (  # noqa: E402
     add_branch_diagnostic_features,
@@ -284,6 +285,7 @@ def run_analysis(args: argparse.Namespace) -> Path:
     router_cfg = dict(PROJECT_CONFIG.get("branch_router_v1", {}))
     router_cfg["enabled"] = True
     router_cfg.update(json.loads(args.router_config_json) if args.router_config_json else {})
+    v2b_cli_cfg = json.loads(args.v2b_config_json) if getattr(args, "v2b_config_json", "") else {}
 
     snapshots = []
     candidate_rows = []
@@ -302,6 +304,10 @@ def run_analysis(args: argparse.Namespace) -> Path:
         "v2b_trend_plus_ai_overlay_plus_crash_minrisk_rescue": [],
     }
     effective_audit_rows: list[dict[str, Any]] = []
+    accepted_swap_rows: list[dict[str, Any]] = []
+    blocked_candidate_rows: list[dict[str, Any]] = []
+    guard_summary_rows: list[dict[str, Any]] = []
+    ai_shadow_rows: list[dict[str, Any]] = []
     focus_details: list[dict[str, Any]] = []
     past_legal_scores: list[dict[str, float]] = []
     branch_score_windows: list[dict[str, float]] = []
@@ -473,6 +479,100 @@ def run_analysis(args: argparse.Namespace) -> Path:
                 "debug": decision_obj.debug_info,
             }
 
+        def realized_ret(stock_id: Any) -> float | None:
+            if stock_id is None or pd.isna(stock_id):
+                return None
+            rows = work[work["stock_id"].astype(str) == str(stock_id)]
+            if rows.empty:
+                return None
+            return float(pd.to_numeric(rows["realized_ret"], errors="coerce").fillna(0.0).iloc[0])
+
+        def swap_delta_fields(record: dict[str, Any]) -> dict[str, Any]:
+            removed_ret = realized_ret(record.get("replaced_stock"))
+            candidate_ret = realized_ret(record.get("candidate_stock"))
+            final_top5 = []
+            overlay_debug = record.get("_overlay_debug", {})
+            if isinstance(overlay_debug, dict):
+                final_top5 = overlay_debug.get("final_top5") or []
+            position_weight = 1.0 / len(final_top5) if final_top5 else 1.0 / 5.0
+            raw_delta = None if removed_ret is None or candidate_ret is None else float(candidate_ret - removed_ret)
+            weighted_delta = None if raw_delta is None else float(position_weight * raw_delta)
+            return {
+                "raw_candidate_return": candidate_ret,
+                "raw_replaced_return": removed_ret,
+                "raw_stock_delta": raw_delta,
+                "position_weight": float(position_weight),
+                "weighted_swap_delta": weighted_delta,
+                "delta_units": "portfolio_weighted_return",
+                "delta_source": "realized_stock_returns_equal_weight_top5",
+            }
+
+        def append_overlay_records(variant_name: str, decision_obj, realized_row: dict[str, Any]) -> None:
+            overlay_debug = (decision_obj.debug_info or {}).get("overlay_decision", {})
+            accepted = overlay_debug.get("accepted_swap_records", []) if isinstance(overlay_debug, dict) else []
+            blocked = overlay_debug.get("blocked_candidate_records", []) if isinstance(overlay_debug, dict) else []
+            summary = overlay_debug.get("guard_summary", []) if isinstance(overlay_debug, dict) else []
+            total_swaps = int(overlay_debug.get("swap_count", 0)) if isinstance(overlay_debug, dict) else 0
+            for idx, record in enumerate(accepted, start=1):
+                delta_fields = swap_delta_fields({**record, "_overlay_debug": overlay_debug})
+                delta_realized = delta_fields["weighted_swap_delta"]
+                accepted_swap_rows.append(
+                    {
+                        "window": win["anchor_date"],
+                        "variant": variant_name,
+                        **record,
+                        "guard_passed_reasons": json.dumps(record.get("guard_passed_reasons", []), ensure_ascii=False),
+                        **delta_fields,
+                        "delta_realized": delta_realized,
+                        "swap_index_in_window": idx,
+                        "total_swaps_in_window": total_swaps,
+                    }
+                )
+                if record.get("branch") == "theme_ai":
+                    shadow_any = any(bool(record.get(key)) for key in [
+                        "would_block_by_shadow_score_margin",
+                        "would_block_by_shadow_risk_increase",
+                        "would_block_by_shadow_default_keep",
+                        "would_block_by_shadow_rank_cap",
+                    ])
+                    ai_shadow_rows.append(
+                        {
+                            "window": win["anchor_date"],
+                            "variant": variant_name,
+                            "candidate_stock": record.get("candidate_stock"),
+                            "replaced_stock": record.get("replaced_stock"),
+                            "actual_ai_swap_accepted": True,
+                            "would_block_by_shadow_score_margin": bool(record.get("would_block_by_shadow_score_margin")),
+                            "would_block_by_shadow_risk_increase": bool(record.get("would_block_by_shadow_risk_increase")),
+                            "would_block_by_shadow_default_keep": bool(record.get("would_block_by_shadow_default_keep")),
+                            "would_block_by_shadow_rank_cap": bool(record.get("would_block_by_shadow_rank_cap")),
+                            **delta_fields,
+                            "actual_delta": delta_realized,
+                            "would_have_blocked_positive_swap": bool(shadow_any and delta_realized is not None and delta_realized > 0),
+                            "would_have_blocked_negative_swap": bool(shadow_any and delta_realized is not None and delta_realized < 0),
+                        }
+                    )
+            for record in blocked:
+                delta_fields = swap_delta_fields({**record, "_overlay_debug": overlay_debug})
+                would_raw_delta = delta_fields["raw_stock_delta"]
+                would_weighted_delta = delta_fields["weighted_swap_delta"]
+                reasons = record.get("blocked_guard_reasons", []) or []
+                blocked_candidate_rows.append(
+                    {
+                        "window": win["anchor_date"],
+                        "variant": variant_name,
+                        **record,
+                        "blocked_guard_reasons": json.dumps(reasons, ensure_ascii=False),
+                        **delta_fields,
+                        "would_have_raw_stock_delta": would_raw_delta,
+                        "would_have_weighted_delta": would_weighted_delta,
+                        "is_known_positive_block_if_available": bool(would_weighted_delta is not None and would_weighted_delta > 0),
+                        "is_known_negative_block_if_available": bool(would_weighted_delta is not None and would_weighted_delta < 0),
+                    }
+                )
+            for row in summary:
+                guard_summary_rows.append({"window": win["anchor_date"], "variant": variant_name, **row})
+
         default_decision = type("D", (), {
             "chosen_branch": "grr_tail_guard",
             "branch_weights": {"grr_tail_guard": 1.0},
@@ -529,6 +629,7 @@ def run_analysis(args: argparse.Namespace) -> Path:
 
         v2b_base = dict(PROJECT_CONFIG.get("branch_router_v2b", {}))
         v2b_base["enabled"] = True
+        v2b_base.update(v2b_cli_cfg)
         v2b_configs = {
             "v2b_trend_overlay_only": {**v2b_base, "trend_overlay_enabled": True, "theme_ai_overlay_enabled": False, "crash_minrisk_enabled": False},
             "v2b_ai_overlay_only": {**v2b_base, "trend_overlay_enabled": False, "theme_ai_overlay_enabled": True, "crash_minrisk_enabled": False},
@@ -536,7 +637,10 @@ def run_analysis(args: argparse.Namespace) -> Path:
             "v2b_trend_plus_ai_overlay_plus_crash_minrisk_rescue": {**v2b_base, "trend_overlay_enabled": True, "theme_ai_overlay_enabled": True, "crash_minrisk_enabled": True},
         }
         for name, cfg in v2b_configs.items():
-            ablation_rows[name].append(realize_decision(route_branch_v2b_overlay(route_inputs, market_state, cfg)))
+            v2b_decision = route_branch_v2b_overlay(route_inputs, market_state, cfg)
+            realized_v2b = realize_decision(v2b_decision)
+            ablation_rows[name].append(realized_v2b)
+            append_overlay_records(name, v2b_decision, realized_v2b)
 
         if win["anchor_date"] in FOCUS_WINDOWS:
             focus_details.append({
@@ -580,7 +684,22 @@ def run_analysis(args: argparse.Namespace) -> Path:
         frame.insert(0, "variant", name)
         ablation_decision_frames.append(frame)
     if ablation_decision_frames:
-        pd.concat(ablation_decision_frames, ignore_index=True).to_csv(out_dir / "ablation_decisions.csv", index=False)
+        ablation_all_df = pd.concat(ablation_decision_frames, ignore_index=True)
+        ablation_all_df.to_csv(out_dir / "ablation_decisions.csv", index=False)
+        paired_delta_distribution(ablation_all_df).to_csv(out_dir / "paired_delta_distribution.csv", index=False)
+    else:
+        ablation_all_df = pd.DataFrame()
+
+    accepted_swaps_df = pd.DataFrame(accepted_swap_rows)
+    blocked_candidates_df = pd.DataFrame(blocked_candidate_rows)
+    guard_summary_df = aggregate_guard_summary(guard_summary_rows)
+    accepted_swaps_df.to_csv(out_dir / "accepted_swaps.csv", index=False)
+    blocked_candidates_df.to_csv(out_dir / "blocked_candidates.csv", index=False)
+    pd.DataFrame(guard_summary_rows).to_csv(out_dir / "guard_summary_by_window.csv", index=False)
+    guard_summary_df.to_csv(out_dir / "guard_summary.csv", index=False)
+    pd.DataFrame(ai_shadow_rows).to_csv(out_dir / "ai_shadow_guard.csv", index=False)
+    reconciliation_df = swap_delta_reconciliation(ablation_all_df, accepted_swaps_df, variant="v2b_trend_plus_ai_overlay")
+    reconciliation_df.to_csv(out_dir / "swap_delta_reconciliation.csv", index=False)
 
     overlay_diag_rows = []
     if not snapshots_df.empty:
@@ -611,6 +730,43 @@ def run_analysis(args: argparse.Namespace) -> Path:
                 }
             )
     pd.DataFrame(overlay_diag_rows).to_csv(out_dir / "overlay_diagnostics.csv", index=False)
+
+    compare_windows = ["2026-03-09", "2025-12-24", "2025-12-31", "2026-01-09"]
+    compare_rows = []
+    for date in compare_windows:
+        candidates = blocked_candidates_df[(blocked_candidates_df.get("window", pd.Series(dtype=str)).astype(str) == date) & (blocked_candidates_df.get("branch", pd.Series(dtype=str)).astype(str) == "trend")] if not blocked_candidates_df.empty else pd.DataFrame()
+        if candidates.empty and not accepted_swaps_df.empty:
+            candidates = accepted_swaps_df[(accepted_swaps_df.get("window", pd.Series(dtype=str)).astype(str) == date) & (accepted_swaps_df.get("branch", pd.Series(dtype=str)).astype(str) == "trend")]
+        if candidates.empty:
+            compare_rows.append({"window": date})
+            continue
+        row = candidates.iloc[0]
+        compare_rows.append(
+            {
+                "window": date,
+                "branch": row.get("branch"),
+                "candidate_stock": row.get("candidate_stock"),
+                "replaced_stock": row.get("replaced_stock"),
+                "candidate_rank": row.get("candidate_rank"),
+                "replaced_rank": row.get("replaced_rank"),
+                "score_margin": row.get("score_margin"),
+                "risk_delta": row.get("risk_delta"),
+                "trend_dispersion": row.get("trend_dispersion"),
+                "default_vote_strength": None,
+                "candidate_theme_concentration": None,
+                "candidate_sector_concentration": None,
+                "candidate_recent_drawdown": None,
+                "candidate_vs_default_vol_adjusted_score": None,
+                "blocked_guard_reasons": row.get("blocked_guard_reasons"),
+                "raw_candidate_return": row.get("raw_candidate_return"),
+                "raw_replaced_return": row.get("raw_replaced_return"),
+                "raw_stock_delta": row.get("raw_stock_delta"),
+                "position_weight": row.get("position_weight"),
+                "would_have_weighted_delta": row.get("would_have_weighted_delta", row.get("weighted_swap_delta", row.get("delta_realized"))),
+                "delta_units": row.get("delta_units"),
+            }
+        )
+    pd.DataFrame(compare_rows).to_csv(out_dir / "comparative_20260309.csv", index=False)
 
     legal_oracle = decisions_df["legal_oracle_score"]
     illegal_oracle = decisions_df["illegal_oracle_score"]
@@ -718,6 +874,16 @@ def run_analysis(args: argparse.Namespace) -> Path:
 
     aggregate["ablations"] = {name: summarize_ablation(rows) for name, rows in ablation_rows.items()}
     aggregate["ablations_10win"] = {name: summarize_ablation(rows[-10:]) for name, rows in ablation_rows.items()}
+    aggregate["accepted_swap_count"] = int(len(accepted_swaps_df))
+    aggregate["blocked_candidate_count"] = int(len(blocked_candidates_df))
+    aggregate["accepted_swap_count_by_variant"] = accepted_swaps_df["variant"].value_counts().to_dict() if not accepted_swaps_df.empty and "variant" in accepted_swaps_df else {}
+    aggregate["blocked_candidate_count_by_variant"] = blocked_candidates_df["variant"].value_counts().to_dict() if not blocked_candidates_df.empty and "variant" in blocked_candidates_df else {}
+    aggregate["guard_summary"] = guard_summary_df.to_dict(orient="records")
+    aggregate["paired_delta_distribution"] = paired_delta_distribution(ablation_all_df).to_dict(orient="records") if not ablation_all_df.empty else []
+    aggregate["swap_delta_reconciliation"] = {
+        "path": str(out_dir / "swap_delta_reconciliation.csv"),
+        "max_abs_reconciliation_error": float(pd.to_numeric(reconciliation_df.get("reconciliation_error", pd.Series(dtype=float)), errors="coerce").abs().max()) if not reconciliation_df.empty else 0.0,
+    }
 
     probe_hits = []
     for row in focus_details:
@@ -884,6 +1050,7 @@ def main() -> None:
     parser.add_argument("--last-n", type=int, default=20)
     parser.add_argument("--label-horizon", type=int, default=5)
     parser.add_argument("--router-config-json", default="")
+    parser.add_argument("--v2b-config-json", default="")
     args = parser.parse_args()
     out_dir = run_analysis(args)
     print(f"Wrote branch router analysis to {out_dir}")

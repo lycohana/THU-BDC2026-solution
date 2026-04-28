@@ -982,10 +982,18 @@ def main() -> None:
     print(f"[batch] anchors={[d.strftime('%Y-%m-%d') for d in anchors]}")
     print(f"[batch] workers={workers}")
 
-    # 限制每个 predict 子进程的 feature_workers，避免 Windows 资源耗尽
-    # Windows multiprocessing IPC 传输大量 DataFrame 时，过多并发进程会触发 OSError 1450
-    safe_fw = max(1, min(4, (os.cpu_count() or 1) // workers))
-    os.environ["BDC_FEATURE_WORKERS"] = str(safe_fw)
+    # 限制每个 predict 子进程的 feature_workers，避免 Windows 资源耗尽。
+    # 如果外部已经显式设置 BDC_FEATURE_WORKERS（例如沙箱里强制单进程），这里尊重外部设置。
+    # Windows multiprocessing IPC 传输大量 DataFrame 时，过多并发进程会触发 OSError 1450/权限错误。
+    env_feature_workers = os.environ.get("BDC_FEATURE_WORKERS")
+    if env_feature_workers is not None:
+        try:
+            safe_fw = max(1, int(env_feature_workers))
+        except ValueError:
+            safe_fw = 1
+    else:
+        safe_fw = max(1, min(4, (os.cpu_count() or 1) // workers))
+        os.environ["BDC_FEATURE_WORKERS"] = str(safe_fw)
     print(f"[batch] feature_workers_per_predict={safe_fw}")
 
     if workers == 1:

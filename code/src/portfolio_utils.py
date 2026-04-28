@@ -92,6 +92,389 @@ def _available_log_zscore(out, col, default=0.0):
     return _zscore(np.log1p(values.clip(lower=0).to_numpy(dtype=np.float64)))
 
 
+def _num_col(frame, col, default=0.0):
+    if col not in frame.columns:
+        return pd.Series(default, index=frame.index, dtype=np.float64)
+    return pd.to_numeric(frame[col], errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(default)
+
+
+def _z(values):
+    series = pd.to_numeric(values, errors='coerce').replace([np.inf, -np.inf], np.nan)
+    fill = series.median() if series.notna().any() else 0.0
+    arr = series.fillna(fill).to_numpy(dtype=np.float64)
+    return _zscore(arr)
+
+
+def _rank_pct(series, ascending=True):
+    values = pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan)
+    fill = values.median() if values.notna().any() else 0.0
+    return values.fillna(fill).rank(method='average', pct=True, ascending=ascending)
+
+
+def _risk_value_frame(frame):
+    return pd.concat(
+        [
+            _num_col(frame, 'sigma20'),
+            _num_col(frame, 'amp20'),
+            _num_col(frame, 'max_drawdown20'),
+        ],
+        axis=1,
+    ).mean(axis=1)
+
+
+def _riskoff_live_candidates(score_df, top_k=20):
+    work = score_df.copy()
+    work['stock_id'] = work['stock_id'].map(normalize_stock_id)
+    ret20 = _num_col(work, 'ret20')
+    sigma20 = _num_col(work, 'sigma20')
+    stats = {
+        'riskoff_triggered': bool(
+            float(ret20.median()) < 0.0
+            and float((ret20 > 0).mean()) < 0.45
+            and float(sigma20.median()) > 0.018
+            and float(ret20.quantile(0.90) - ret20.quantile(0.10)) > 0.10
+        ),
+        'median_ret20': float(ret20.median()),
+        'breadth20': float((ret20 > 0).mean()),
+        'median_sigma20': float(sigma20.median()),
+        'dispersion20': float(ret20.quantile(0.90) - ret20.quantile(0.10)),
+    }
+    if not stats['riskoff_triggered']:
+        return pd.DataFrame(), stats
+
+    stable = stable_filter(work, liquidity_quantile=0.20, sigma_quantile=0.85).copy()
+    if stable.empty:
+        return pd.DataFrame(), stats
+    stable['fused_z'] = _z(_num_col(stable, 'score'))
+    stable['lgb_z'] = _z(_num_col(stable, 'lgb'))
+    stable['log_liquidity_z'] = _z(np.log1p(_num_col(stable, 'median_amount20').clip(lower=0.0)))
+    stable['ret5_z'] = _z(_num_col(stable, 'ret5'))
+    stable['ret20_z'] = _z(_num_col(stable, 'ret20'))
+    stable['amp_z'] = _z(_num_col(stable, 'amp20'))
+    stable['negative_ret20_penalty'] = (_num_col(stable, 'ret20') < 0.0).astype(float)
+    stable['_risk_value'] = _risk_value_frame(stable)
+    stable['riskoff_rerank_score'] = (
+        0.30 * stable['fused_z']
+        + 0.10 * stable['lgb_z']
+        + 0.30 * stable['log_liquidity_z']
+        + 0.10 * stable['ret5_z']
+        + 0.10 * stable['ret20_z']
+        - 0.10 * stable['amp_z']
+        - 0.50 * stable['negative_ret20_penalty']
+    )
+    out = stable.sort_values('riskoff_rerank_score', ascending=False).head(top_k).copy()
+    out['candidate_rank'] = np.arange(1, len(out) + 1)
+    out['candidate_score'] = out['riskoff_rerank_score']
+    return out, stats
+
+
+def _top5_frame(selected):
+    out = selected.copy()
+    out['stock_id'] = out['stock_id'].map(normalize_stock_id)
+    return out.sort_values('score', ascending=False).head(5).copy()
+
+
+def _risk_target_row(top5, rule='lowest_score'):
+    work = top5.copy()
+    work['_risk_value'] = _risk_value_frame(work)
+    if rule == 'highest_risk':
+        return work.sort_values(['_risk_value', 'score'], ascending=[False, True]).iloc[0]
+    return work.sort_values(['score', '_risk_value'], ascending=[True, False]).iloc[0]
+
+
+def _force_selected_top5(final_rows, reason):
+    out = final_rows.copy().reset_index(drop=True)
+    # build_weight_portfolio sorts by score, so freeze the overlay order with
+    # synthetic local scores after a runtime-safe swap decision has been made.
+    out['score'] = np.linspace(float(len(out)), 1.0, len(out))
+    out['supplemental_overlay_reason'] = reason
+    return out
+
+
+def _apply_riskoff_rank4_dynamic_overlay(score_df, selected, cfg):
+    top5 = _top5_frame(selected)
+    if len(top5) < 5:
+        return selected, None
+    rank_cap = int(cfg.get('riskoff_rank_cap', 4))
+    risk_delta_cap = float(cfg.get('riskoff_risk_delta_cap', 0.03))
+    defensive_risk_max = float(cfg.get('riskoff_defensive_candidate_risk_max', 0.04))
+    defensive_gap_min = float(cfg.get('riskoff_defensive_risk_gap_min', 0.10))
+    candidates, stats = _riskoff_live_candidates(score_df, top_k=20)
+    if candidates.empty:
+        return selected, {'accepted': False, 'overlay': 'riskoff_rank4_dynamic', **stats}
+    selected_ids = set(top5['stock_id'].astype(str))
+    candidates = candidates[
+        (~candidates['stock_id'].astype(str).isin(selected_ids))
+        & (pd.to_numeric(candidates['candidate_rank'], errors='coerce').fillna(999) <= rank_cap)
+    ].copy()
+    if candidates.empty:
+        return selected, {'accepted': False, 'overlay': 'riskoff_rank4_dynamic', 'blocked_reason': 'no_rank4_candidate', **stats}
+
+    default_target = _risk_target_row(top5, 'lowest_score')
+    high_risk_target = _risk_target_row(top5, 'highest_risk')
+    for _, candidate in candidates.iterrows():
+        candidate_risk = float(candidate.get('_risk_value', 0.0))
+        high_risk_gap = float(high_risk_target['_risk_value']) - candidate_risk
+        target = high_risk_target if candidate_risk <= defensive_risk_max and high_risk_gap >= defensive_gap_min else default_target
+        risk_delta = candidate_risk - float(target['_risk_value'])
+        if risk_delta > risk_delta_cap:
+            continue
+        final = top5[top5['stock_id'] != target['stock_id']].copy()
+        final = pd.concat([final, candidate.to_frame().T], ignore_index=True)
+        final = final.head(5)
+        info = {
+            'accepted': True,
+            'overlay': 'riskoff_rank4_dynamic',
+            'candidate_stock': str(candidate['stock_id']),
+            'replaced_stock': str(target['stock_id']),
+            'candidate_rank': int(candidate['candidate_rank']),
+            'risk_delta': risk_delta,
+            **stats,
+        }
+        return _force_selected_top5(final, 'riskoff_rank4_dynamic'), info
+    return selected, {'accepted': False, 'overlay': 'riskoff_rank4_dynamic', 'blocked_reason': 'risk_delta_cap', **stats}
+
+
+def _pullback_rebound_candidates(score_df, selected_ids, rank_cap=1):
+    out = score_df.copy()
+    out['stock_id'] = out['stock_id'].map(normalize_stock_id)
+    out = out[~out['stock_id'].astype(str).isin(set(selected_ids))].copy()
+    if out.empty:
+        return out
+    ret1 = _num_col(out, 'ret1')
+    ret5 = _num_col(out, 'ret5')
+    ret10 = _num_col(out, 'ret10')
+    ret20 = _num_col(out, 'ret20')
+    sigma20 = _num_col(out, 'sigma20')
+    amp20 = _num_col(out, 'amp20')
+    drawdown20 = _num_col(out, 'max_drawdown20')
+    downside_beta60 = _num_col(out, 'downside_beta60')
+    beta60 = _num_col(out, 'beta60')
+    model = _num_col(out, 'grr_final_score', default=0.0)
+    consensus = _num_col(out, 'grr_consensus_norm', default=0.0)
+    risk = _risk_value_frame(out)
+    market_ret20 = float(ret20.median())
+    market_ret10 = float(ret10.median())
+    out['liquidity_rank'] = _rank_pct(_num_col(out, 'median_amount20'))
+    out['model_rank'] = _rank_pct(model)
+    out['consensus_rank'] = _rank_pct(consensus)
+    out['risk_rank'] = _rank_pct(risk)
+    out['resid_ret20'] = ret20 - beta60 * market_ret20
+    out['resid_ret10'] = ret10 - beta60 * market_ret10
+    out['pullback_rebound_score'] = (
+        0.30 * out['model_rank']
+        + 0.20 * _rank_pct(out['resid_ret20'])
+        + 0.20 * _rank_pct(-ret5)
+        + 0.15 * out['liquidity_rank']
+        + 0.10 * out['consensus_rank']
+        - 0.20 * out['risk_rank']
+        + 0.15 * _rank_pct(ret1)
+    )
+    mask = (
+        (out['liquidity_rank'] >= 0.30)
+        & (sigma20 < 0.050)
+        & (amp20 < 0.10)
+        & (drawdown20 > -0.13)
+        & (downside_beta60 < 1.40)
+        & (out['model_rank'] >= 0.70)
+        & (ret20 > 0.02)
+        & (ret20 < 0.32)
+        & (ret5 > -0.08)
+        & (ret5 < 0.015)
+        & (ret1 > 0.0)
+    )
+    candidates = out[mask].sort_values('pullback_rebound_score', ascending=False).copy()
+    candidates['candidate_rank'] = np.arange(1, len(candidates) + 1)
+    return candidates[candidates['candidate_rank'] <= int(rank_cap)].copy()
+
+
+def _apply_pullback_rebound_overlay(score_df, selected, cfg):
+    top5 = _top5_frame(selected)
+    if len(top5) < 5:
+        return selected, None
+    candidates = _pullback_rebound_candidates(score_df, top5['stock_id'].astype(str).tolist(), rank_cap=int(cfg.get('pullback_rank_cap', 1)))
+    if candidates.empty:
+        return selected, {'accepted': False, 'overlay': 'pullback_rebound', 'blocked_reason': 'no_candidate'}
+    target = _risk_target_row(top5, 'highest_risk')
+    candidate = candidates.iloc[0]
+    final = top5[top5['stock_id'] != target['stock_id']].copy()
+    final = pd.concat([final, candidate.to_frame().T], ignore_index=True).head(5)
+    return _force_selected_top5(final, 'pullback_rebound'), {
+        'accepted': True,
+        'overlay': 'pullback_rebound',
+        'candidate_stock': str(candidate['stock_id']),
+        'replaced_stock': str(target['stock_id']),
+        'candidate_rank': int(candidate['candidate_rank']),
+    }
+
+
+def _stress_state(score_df, cfg):
+    ret20 = _num_col(score_df, 'ret20')
+    sigma20 = _num_col(score_df, 'sigma20')
+    stats = {
+        'median_ret20': float(ret20.median()),
+        'breadth20': float((ret20 > 0).mean()),
+        'median_sigma20': float(sigma20.median()),
+        'dispersion20': float(ret20.quantile(0.90) - ret20.quantile(0.10)),
+    }
+    stats['stress_triggered'] = bool(
+        stats['median_ret20'] < float(cfg.get('stress_chaser_median_ret20_max', 0.0))
+        and stats['breadth20'] <= float(cfg.get('stress_chaser_breadth20_max', 0.50))
+        and stats['median_sigma20'] > float(cfg.get('stress_chaser_median_sigma20_min', 0.018))
+        and stats['dispersion20'] > float(cfg.get('stress_chaser_dispersion20_min', 0.10))
+    )
+    return stats
+
+
+def _add_runtime_minrisk_scores(score_df):
+    out = score_df.copy()
+    out['stock_id'] = out['stock_id'].map(normalize_stock_id)
+    out['liq_rank'] = _rank_pct(_num_col(out, 'median_amount20'))
+    out['sigma_rank'] = _rank_pct(_num_col(out, 'sigma20'))
+    out['amp_rank'] = _rank_pct(_num_col(out, 'amp20'))
+    out['ret1_rank'] = _rank_pct(_num_col(out, 'ret1'))
+    out['ret5_rank'] = _rank_pct(_num_col(out, 'ret5'))
+    out['downside_beta60_rank'] = _rank_pct(_num_col(out, 'downside_beta60'))
+    out['max_drawdown20_rank'] = _rank_pct(_num_col(out, 'max_drawdown20'))
+    out['tail_risk_flag'] = (
+        (out['sigma_rank'] > 0.85)
+        | (out['amp_rank'] > 0.85)
+        | (out['downside_beta60_rank'] > 0.85)
+        | (out['max_drawdown20_rank'] > 0.85)
+    )
+    out['reversal_flag'] = (out['ret5_rank'] > 0.70) & (out['ret1_rank'] < 0.30)
+    out['runtime_minrisk_score'] = (
+        0.35 * _rank_pct(_num_col(out, 'score'))
+        + 0.15 * _rank_pct(_num_col(out, 'lgb'))
+        + 0.20 * out['liq_rank']
+        - 0.15 * out['sigma_rank']
+        - 0.10 * out['downside_beta60_rank']
+        - 0.10 * out['max_drawdown20_rank']
+        - 0.05 * out['amp_rank']
+    )
+    return out
+
+
+def _runtime_minrisk_candidates(score_df, selected_ids):
+    out = _add_runtime_minrisk_scores(score_df)
+    selected_ids = {str(x) for x in selected_ids}
+    cond = (
+        ~out['stock_id'].astype(str).isin(selected_ids)
+        & ~out['tail_risk_flag'].astype(bool)
+        & ~out['reversal_flag'].astype(bool)
+        & (out['liq_rank'] >= 0.15)
+        & (out['sigma_rank'] <= 0.75)
+        & (out['downside_beta60_rank'] <= 0.75)
+        & (out['max_drawdown20_rank'] <= 0.75)
+        & (out['amp_rank'] <= 0.85)
+        & (out['ret1_rank'] >= 0.20)
+    )
+    candidates = out[cond].copy()
+    if len(candidates) < 5:
+        relaxed = out[
+            ~out['stock_id'].astype(str).isin(selected_ids)
+            & (out['liq_rank'] >= 0.10)
+            & (out['sigma_rank'] <= 0.85)
+            & ~out['reversal_flag'].astype(bool)
+        ].copy()
+        if len(relaxed) >= 1:
+            candidates = relaxed
+    return candidates.sort_values('runtime_minrisk_score', ascending=False)
+
+
+def _stress_chaser_target(top5, cfg):
+    work = top5.copy()
+    ret1 = _num_col(work, 'ret1')
+    ret5 = _num_col(work, 'ret5')
+    ret20 = _num_col(work, 'ret20')
+    amp20 = _num_col(work, 'amp20')
+    downside_beta60 = _num_col(work, 'downside_beta60')
+    panic = (
+        (ret1 < float(cfg.get('stress_panic_ret1_max', -0.05)))
+        & (downside_beta60 > float(cfg.get('stress_panic_downside_beta_min', 1.50)))
+        & (ret20 > 0.0)
+    )
+    hot = (
+        (ret20 > 0.0)
+        & (ret20 < float(cfg.get('stress_hot_ret20_max', 0.25)))
+        & (ret5 > float(cfg.get('stress_hot_ret5_min', 0.04)))
+        & (amp20 > float(cfg.get('stress_hot_amp20_min', 0.12)))
+        & (downside_beta60 > float(cfg.get('stress_hot_downside_beta_min', 0.80)))
+    )
+    work['_stress_chaser_score'] = (
+        panic.astype(float) * 100.0
+        + hot.astype(float) * (1.0 + amp20 + downside_beta60 / 10.0)
+    )
+    targets = work[work['_stress_chaser_score'] > 0.0].sort_values('_stress_chaser_score', ascending=False)
+    if targets.empty:
+        return None
+    return targets.iloc[0]
+
+
+def _apply_stress_chaser_veto_overlay(score_df, selected, cfg):
+    if not bool(cfg.get('stress_chaser_veto_enabled', False)):
+        return selected, None
+    top5 = _top5_frame(selected)
+    if len(top5) < 5:
+        return selected, None
+    stats = _stress_state(score_df, cfg)
+    if not stats['stress_triggered']:
+        return selected, {'accepted': False, 'overlay': 'stress_chaser_veto', **stats}
+    target = _stress_chaser_target(top5, cfg)
+    if target is None:
+        return selected, {'accepted': False, 'overlay': 'stress_chaser_veto', 'blocked_reason': 'no_stress_chaser_target', **stats}
+    selected_ids = set(top5['stock_id'].astype(str))
+    candidates = _runtime_minrisk_candidates(score_df, selected_ids)
+    if candidates.empty:
+        return selected, {'accepted': False, 'overlay': 'stress_chaser_veto', 'blocked_reason': 'no_minrisk_candidate', **stats}
+    candidate = candidates.iloc[0]
+    final = top5[top5['stock_id'] != target['stock_id']].copy()
+    final = pd.concat([final, candidate.to_frame().T], ignore_index=True).head(5)
+    info = {
+        'accepted': True,
+        'overlay': 'stress_chaser_veto',
+        'candidate_stock': str(candidate['stock_id']),
+        'replaced_stock': str(target['stock_id']),
+        'target_score': float(target['_stress_chaser_score']),
+        **stats,
+    }
+    return _force_selected_top5(final, 'stress_chaser_veto'), info
+
+
+def apply_supplemental_overlay(score_df, selected, cfg=None):
+    cfg = cfg or {}
+    if not bool(cfg.get('supplemental_overlay_enabled', False)):
+        return selected
+    if bool(cfg.get('supplemental_overlay_shadow_only', True)):
+        return selected
+    priority = cfg.get('supplemental_overlay_priority', [])
+    current = selected
+    diagnostics = []
+    for name in priority:
+        if name == 'riskoff_fill_rank4_dynamic_defensive_target_no_v2b_swap':
+            current, info = _apply_riskoff_rank4_dynamic_overlay(score_df, current, cfg)
+        elif name == 'pullback_rebound_highest_risk':
+            current, info = _apply_pullback_rebound_overlay(score_df, current, cfg)
+        else:
+            info = {'accepted': False, 'overlay': name, 'blocked_reason': 'unsupported'}
+        if info:
+            diagnostics.append(info)
+            if info.get('accepted'):
+                break
+
+    current, veto_info = _apply_stress_chaser_veto_overlay(score_df, current, cfg)
+    if veto_info:
+        diagnostics.append(veto_info)
+
+    current.attrs['supplemental_overlay_info'] = diagnostics
+    accepted = [info for info in diagnostics if info.get('accepted')]
+    if accepted:
+        print(f"[BDC][supplemental_overlay] accepted={accepted}")
+    else:
+        print(f"[BDC][supplemental_overlay] no_swap diagnostics={diagnostics}")
+    return current
+
+
 def equal_weight_portfolio(score_df, k=5, exposure_cap=1.0):
     top = _topk(score_df, k=k)
     if len(top) == 0:

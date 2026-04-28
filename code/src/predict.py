@@ -17,7 +17,7 @@ from features import build_history_feature_frame
 from feature_registry import finalize_feature_frame, get_feature_columns, get_feature_engineer
 from lgb_branch import load_lgb_branches, predict_lgb_components, predict_lgb_score
 from model import StockTransformer
-from portfolio_utils import build_weight_portfolio, select_candidates as shared_select_candidates
+from portfolio_utils import apply_supplemental_overlay, build_weight_portfolio, select_candidates as shared_select_candidates
 from reranker import apply_grr_top5
 
 
@@ -2625,6 +2625,11 @@ def main():
             post_cfg,
             history_df=raw_df,
             asof_date=latest_date,
+        )
+        filtered = apply_supplemental_overlay(
+            score_df,
+            filtered,
+            config.get('branch_router_v2b', {}),
         )
         breadth = artifacts['breadth']
         if 'exposure_cap' in post_cfg:

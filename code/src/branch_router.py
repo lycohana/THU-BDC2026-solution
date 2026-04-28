@@ -69,18 +69,71 @@ DEFAULT_BRANCH_ROUTER_V2B_CONFIG = {
     "trend_clutter_max": 0.70,
     "trend_max_swaps": 1,
     "trend_min_replacement_gap": 0.04,
+    "trend_dispersion_max": 0.13,
+    "trend_candidate_rank_cap": 6,
     "trend_sigma_cap_q": 0.90,
     "trend_amp_cap_q": 0.90,
     "trend_drawdown_cap_q": 0.90,
     "trend_current_ret20_max": 0.12,
+    "default_strong_keep_raw_norm": 0.70,
+    "default_strong_keep_rank_cap": 2,
+    "trend_risk_increase_max": 0.20,
+    "trend_risk_increase_rank_cap": 3,
     "theme_ai_window_threshold": 0.62,
     "theme_ai_max_swaps": 1,
     "theme_ai_min_replacement_gap": 0.08,
+    "theme_ai_candidate_rank_cap": 3,
+    "theme_ai_cooling_weak_guard_enabled": True,
+    "theme_ai_cooling_consensus_max": 1.00,
+    "theme_ai_cooling_ret20_max": 0.0,
+    "theme_ai_cooling_amt_ratio5_max": 0.90,
+    "theme_ai_cooling_to_ratio5_max": 0.90,
+    "theme_ai_risk_increase_guard_enabled": True,
+    "theme_ai_risk_increase_max": 0.35,
+    "theme_ai_risk_increase_rank_min": 3,
+    "theme_ai_consensus_max": 0.70,
+    "trend_secondary_amp_guard_enabled": True,
+    "trend_secondary_amp_rank_min": 2,
+    "trend_secondary_amp_cap_q": 0.80,
     "theme_ai_sigma_cap_q": 0.86,
     "theme_ai_amp_cap_q": 0.86,
     "theme_ai_drawdown_cap_q": 0.88,
     "theme_ai_current_ret20_max": 0.02,
+    "shadow_theme_ai_score_margin_min": 0.08,
+    "shadow_theme_ai_risk_increase_max": 0.20,
+    "shadow_theme_ai_default_keep_raw_norm": 0.70,
+    "shadow_theme_ai_candidate_rank_cap": 3,
     "liquidity_min_rank": 0.05,
+    "supplemental_overlay_enabled": True,
+    "supplemental_overlay_shadow_only": False,
+    "supplemental_overlay_name": "riskoff_rank4_dynamic_pullback_v1",
+    "supplemental_overlay_max_swaps": 1,
+    "supplemental_overlay_priority": [
+        "riskoff_fill_rank4_dynamic_defensive_target_no_v2b_swap",
+        "pullback_rebound_highest_risk",
+    ],
+    "riskoff_rank_cap": 4,
+    "riskoff_risk_delta_cap": 0.03,
+    "riskoff_defensive_candidate_risk_max": 0.04,
+    "riskoff_defensive_risk_gap_min": 0.10,
+    "pullback_rank_cap": 1,
+    "stress_chaser_veto_enabled": True,
+    "stress_chaser_veto_max_swaps": 1,
+    "stress_chaser_median_ret20_max": 0.0,
+    "stress_chaser_breadth20_max": 0.50,
+    "stress_chaser_median_sigma20_min": 0.018,
+    "stress_chaser_dispersion20_min": 0.10,
+    "stress_panic_ret1_max": -0.05,
+    "stress_panic_downside_beta_min": 1.50,
+    "stress_hot_ret5_min": 0.04,
+    "stress_hot_ret20_max": 0.25,
+    "stress_hot_amp20_min": 0.12,
+    "stress_hot_downside_beta_min": 0.80,
+    "supplemental_overlay_experimental_priority": [
+        "riskoff_fill_rank4_dynamic_defensive_target_no_v2b_swap",
+        "pullback_rebound_highest_risk",
+        "model_confirmed_chase",
+    ],
 }
 
 
@@ -993,6 +1046,7 @@ def _default_keep_scores(default_output: Any, rrf_k: int = 60) -> tuple[list[str
         )
         keep[stock_id] = float(score)
         debug[stock_id] = {
+            "rank_in_branch": _safe_float(row.get("rank_in_branch"), 0.0),
             "rank_score": float(rank_score),
             "raw_norm": raw_norm,
             "consensus": consensus,
@@ -1043,6 +1097,116 @@ def _hard_veto(row: pd.Series, prefix: str, cfg: dict[str, Any]) -> dict[str, bo
         "liquidity_floor": _safe_float(row.get("_liq_rank_for_router"), 0.5) < float(cfg.get("liquidity_min_rank", 0.05)),
         "high_risk_chaser": bool(row.get("high_risk_chaser_flag", False)),
     }
+
+
+def _overlay_branch_label(source_branch: str) -> str:
+    if source_branch == "trend_uncluttered":
+        return "trend"
+    if source_branch == "ai_hardware_mainline_v1":
+        return "theme_ai"
+    return "other"
+
+
+def _overlay_record(
+    candidate: OverlayCandidate,
+    target: str | None,
+    target_debug: dict[str, Any],
+    market_state: dict[str, Any],
+    *,
+    accepted: bool,
+    guard_reasons: list[str] | None = None,
+    score_margin: float | None = None,
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    replaced_risk = _safe_float(target_debug.get("risk_rank"), 0.5)
+    candidate_risk = _safe_float(candidate.risk_features.get("risk_rank"), 0.5)
+    score_gap = candidate.overlay_score - _safe_float(target_debug.get("keep_score"), 0.0) if score_margin is None else score_margin
+    cfg = cfg or {}
+    shadow = {
+        "would_block_by_shadow_score_margin": bool(
+            candidate.source_branch == "ai_hardware_mainline_v1"
+            and score_gap < float(cfg.get("shadow_theme_ai_score_margin_min", 0.08))
+        ),
+        "would_block_by_shadow_risk_increase": bool(
+            candidate.source_branch == "ai_hardware_mainline_v1"
+            and (candidate_risk - replaced_risk) > float(cfg.get("shadow_theme_ai_risk_increase_max", 0.20))
+        ),
+        "would_block_by_shadow_default_keep": bool(
+            candidate.source_branch == "ai_hardware_mainline_v1"
+            and _safe_float(target_debug.get("raw_norm"), 0.0) >= float(cfg.get("shadow_theme_ai_default_keep_raw_norm", 0.70))
+        ),
+        "would_block_by_shadow_rank_cap": bool(
+            candidate.source_branch == "ai_hardware_mainline_v1"
+            and candidate.source_rank > int(cfg.get("shadow_theme_ai_candidate_rank_cap", 3))
+        ),
+    }
+    return {
+        "branch": _overlay_branch_label(candidate.source_branch),
+        "source_branch": candidate.source_branch,
+        "replaced_stock": target,
+        "candidate_stock": candidate.stock_id,
+        "replaced_rank": target_debug.get("rank_in_branch"),
+        "candidate_rank": candidate.source_rank,
+        "replaced_score": target_debug.get("keep_score"),
+        "candidate_score": candidate.overlay_score,
+        "score_margin": float(score_gap),
+        "replaced_risk": replaced_risk,
+        "candidate_risk": candidate_risk,
+        "risk_delta": float(candidate_risk - replaced_risk),
+        "trend_dispersion": market_state.get("_router_trend_dispersion"),
+        "theme_ai_consensus": market_state.get("_router_theme_ai_consensus"),
+        "guard_passed_reasons": ["passed_hard_veto", "passed_score_margin"] if accepted else [],
+        "blocked_by_guard": not accepted,
+        "blocked_guard_reasons": guard_reasons or [],
+        "veto_flags": candidate.veto_flags,
+        "candidate_debug_components": candidate.debug_components,
+        **shadow,
+    }
+
+
+def _guard_summary(accepted: list[dict[str, Any]], blocked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    reason_map = {
+        "trend_dispersion_too_high": "blocked_by_trend_dispersion",
+        "trend_candidate_rank_too_deep": "blocked_by_candidate_rank",
+        "theme_ai_candidate_rank_too_deep": "blocked_by_candidate_rank",
+        "theme_ai_cooling_weak_guard": "blocked_by_theme_ai_cooling_weak",
+        "theme_ai_risk_increase_guard": "blocked_by_theme_ai_risk_increase",
+        "trend_secondary_amp_guard": "blocked_by_trend_secondary_amp",
+        "default_strong_keep_guard": "blocked_by_default_strong_keep",
+        "trend_risk_increase_guard": "blocked_by_risk_increase",
+        "theme_ai_consensus_too_high": "blocked_by_ai_consensus",
+        "branch_swap_cap_reached": "blocked_by_branch_cap",
+        "max_total_swaps_reached": "blocked_by_total_cap",
+    }
+    branches = ["trend", "theme_ai"]
+    out = []
+    for branch in branches:
+        acc = [row for row in accepted if row.get("branch") == branch]
+        blk = [row for row in blocked if row.get("branch") == branch]
+        row = {
+            "branch": branch,
+            "candidates_generated": int(len(acc) + len(blk)),
+            "accepted": int(len(acc)),
+            "blocked_total": int(len(blk)),
+            "blocked_by_trend_dispersion": 0,
+            "blocked_by_candidate_rank": 0,
+            "blocked_by_default_strong_keep": 0,
+            "blocked_by_risk_increase": 0,
+            "blocked_by_ai_consensus": 0,
+            "blocked_by_theme_ai_cooling_weak": 0,
+            "blocked_by_theme_ai_risk_increase": 0,
+            "blocked_by_trend_secondary_amp": 0,
+            "blocked_by_branch_cap": 0,
+            "blocked_by_total_cap": 0,
+        }
+        for blocked_row in blk:
+            for reason in blocked_row.get("blocked_guard_reasons", []) or []:
+                key = reason_map.get(reason)
+                if key:
+                    row[key] += 1
+        row["accept_rate"] = float(row["accepted"] / row["candidates_generated"]) if row["candidates_generated"] else 0.0
+        out.append(row)
+    return out
 
 
 def build_overlay_candidates(
@@ -1120,6 +1284,9 @@ def build_overlay_candidates(
                     "dispersion_norm": dispersion_norm,
                     "independence_bonus": independence,
                     "risk_penalty_small": 0.04 * risk_rank,
+                    "ret20": _safe_float(row.get("ret20"), 0.0),
+                    "amt_ratio5": _safe_float(row.get("amt_ratio5"), 1.0),
+                    "to_ratio5": _safe_float(row.get("to_ratio5"), 1.0),
                 },
             )
         )
@@ -1138,6 +1305,8 @@ def apply_candidate_overlay(
     final = list(default_top5)
     swaps: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
+    accepted_records: list[dict[str, Any]] = []
+    blocked_records: list[dict[str, Any]] = []
     source_counts: dict[str, int] = {}
     sorted_candidates = sorted(
         [c for c in overlay_candidates if not c.in_default_top5],
@@ -1145,42 +1314,91 @@ def apply_candidate_overlay(
         reverse=True,
     )
     for candidate in sorted_candidates:
-        if len(swaps) >= int(cfg.get("max_total_swaps", 2)):
-            rejected.append({**asdict(candidate), "reject_reason": "total_swap_limit"})
-            continue
+        reject_reasons: list[str] = []
         prefix = "trend" if candidate.source_branch == "trend_uncluttered" else "theme_ai"
         max_swaps = int(cfg.get(f"{prefix}_max_swaps", 1))
         min_gap = float(cfg.get(f"{prefix}_min_replacement_gap", 0.08))
-        if source_counts.get(candidate.source_branch, 0) >= max_swaps:
-            rejected.append({**asdict(candidate), "reject_reason": "source_swap_limit"})
-            continue
-        if any(candidate.veto_flags.values()):
-            rejected.append({**asdict(candidate), "reject_reason": "post_overlay_hard_veto"})
-            continue
         available_targets = [stock for stock in final if stock not in {swap["added_stock"] for swap in swaps}]
+        target = min(available_targets, key=lambda stock: keep_scores.get(stock, 0.0)) if available_targets else candidate.replacement_target
+        target_debug = keep_debug.get(str(target), {}) if target is not None else {}
+        risk_increase = _safe_float(candidate.risk_features.get("risk_rank"), 0.5) - _safe_float(target_debug.get("risk_rank"), 0.5)
+        gap = candidate.overlay_score - keep_scores.get(str(target), 0.0) if target is not None else candidate.replacement_gain_estimate
+        if len(swaps) >= int(cfg.get("max_total_swaps", 2)):
+            reject_reasons.append("max_total_swaps_reached")
+        if candidate.source_branch == "trend_uncluttered" and candidate.source_rank > int(cfg.get("trend_candidate_rank_cap", 6)):
+            reject_reasons.append("trend_candidate_rank_too_deep")
+        if candidate.source_branch == "ai_hardware_mainline_v1" and candidate.source_rank > int(cfg.get("theme_ai_candidate_rank_cap", 3)):
+            reject_reasons.append("theme_ai_candidate_rank_too_deep")
+        if (
+            bool(cfg.get("theme_ai_cooling_weak_guard_enabled", True))
+            and candidate.source_branch == "ai_hardware_mainline_v1"
+            and candidate.consensus_support <= float(cfg.get("theme_ai_cooling_consensus_max", 1.00))
+            and _safe_float(candidate.debug_components.get("ret20"), 0.0) < float(cfg.get("theme_ai_cooling_ret20_max", 0.0))
+            and _safe_float(candidate.debug_components.get("amt_ratio5"), 1.0) < float(cfg.get("theme_ai_cooling_amt_ratio5_max", 0.90))
+            and _safe_float(candidate.debug_components.get("to_ratio5"), 1.0) < float(cfg.get("theme_ai_cooling_to_ratio5_max", 0.90))
+        ):
+            reject_reasons.append("theme_ai_cooling_weak_guard")
+        if (
+            bool(cfg.get("theme_ai_risk_increase_guard_enabled", True))
+            and candidate.source_branch == "ai_hardware_mainline_v1"
+            and candidate.source_rank >= int(cfg.get("theme_ai_risk_increase_rank_min", 3))
+            and risk_increase > float(cfg.get("theme_ai_risk_increase_max", 0.35))
+        ):
+            reject_reasons.append("theme_ai_risk_increase_guard")
+        if (
+            bool(cfg.get("trend_secondary_amp_guard_enabled", True))
+            and candidate.source_branch == "trend_uncluttered"
+            and candidate.source_rank >= int(cfg.get("trend_secondary_amp_rank_min", 2))
+            and _safe_float(candidate.risk_features.get("amp_rank"), 0.5) > float(cfg.get("trend_secondary_amp_cap_q", 0.80))
+        ):
+            reject_reasons.append("trend_secondary_amp_guard")
+        if source_counts.get(candidate.source_branch, 0) >= max_swaps:
+            reject_reasons.append("branch_swap_cap_reached")
+        if any(candidate.veto_flags.values()):
+            reject_reasons.extend([f"hard_veto_{key}" for key, value in candidate.veto_flags.items() if value])
         if not available_targets:
-            rejected.append({**asdict(candidate), "reject_reason": "no_replacement_target"})
-            continue
-        target = min(available_targets, key=lambda stock: keep_scores.get(stock, 0.0))
-        gap = candidate.overlay_score - keep_scores.get(target, 0.0)
+            reject_reasons.append("no_replacement_target")
+        if (
+            bool(cfg.get("default_strong_keep_guard", True))
+            and
+            candidate.source_branch == "trend_uncluttered"
+            and candidate.source_rank > int(cfg.get("default_strong_keep_rank_cap", 2))
+            and _safe_float(target_debug.get("raw_norm"), 0.0) >= float(cfg.get("default_strong_keep_raw_norm", 0.70))
+        ):
+            reject_reasons.append("default_strong_keep_guard")
+        if (
+            bool(cfg.get("trend_risk_increase_guard", True))
+            and
+            candidate.source_branch == "trend_uncluttered"
+            and candidate.source_rank > int(cfg.get("trend_risk_increase_rank_cap", 3))
+            and risk_increase > float(cfg.get("trend_risk_increase_max", 0.20))
+        ):
+            reject_reasons.append("trend_risk_increase_guard")
         if gap < min_gap:
-            rejected.append({**asdict(candidate), "reject_reason": "replacement_gap_below_threshold", "replacement_gap": float(gap)})
+            reject_reasons.append("replacement_gap_below_threshold")
+        if reject_reasons:
+            record = _overlay_record(candidate, str(target) if target is not None else None, target_debug, market_state, accepted=False, guard_reasons=reject_reasons, score_margin=float(gap), cfg=cfg)
+            primary_reason = "post_overlay_hard_veto" if any(reason.startswith("hard_veto_") for reason in reject_reasons) else reject_reasons[0]
+            rejected.append({**asdict(candidate), **record, "reject_reason": primary_reason, "replacement_target": target, "replacement_gap": float(gap), "risk_increase": float(risk_increase)})
+            blocked_records.append(record)
             continue
-        idx = final.index(target)
+        idx = final.index(str(target))
         final[idx] = candidate.stock_id
         source_counts[candidate.source_branch] = source_counts.get(candidate.source_branch, 0) + 1
-        swaps.append(
-            {
-                "removed_stock": target,
-                "added_stock": candidate.stock_id,
-                "source_branch": candidate.source_branch,
-                "replacement_gap": float(gap),
-                "candidate_overlay_score": candidate.overlay_score,
-                "removed_keep_score": keep_scores.get(target, 0.0),
-                "veto_flags": candidate.veto_flags,
-                "replacement_target_reason": "weakest_default_keep_score",
-            }
-        )
+        record = _overlay_record(candidate, str(target), target_debug, market_state, accepted=True, score_margin=float(gap), cfg=cfg)
+        swap = {
+            "removed_stock": target,
+            "added_stock": candidate.stock_id,
+            "source_branch": candidate.source_branch,
+            "replacement_gap": float(gap),
+            "candidate_overlay_score": candidate.overlay_score,
+            "removed_keep_score": keep_scores.get(str(target), 0.0),
+            "veto_flags": candidate.veto_flags,
+            "replacement_target_reason": "weakest_default_keep_score",
+            **record,
+        }
+        swaps.append(swap)
+        accepted_records.append(record)
     return OverlayDecision(
         final_top5=final,
         swaps=swaps,
@@ -1195,8 +1413,42 @@ def apply_candidate_overlay(
             "weakest_default_stock": min(keep_scores, key=keep_scores.get) if keep_scores else None,
             "replacement_target_reason": "weakest_default_keep_score",
             "post_overlay_hard_veto_only": True,
+            "accepted_swap_records": accepted_records,
+            "blocked_candidate_records": blocked_records,
+            "guard_summary": _guard_summary(accepted_records, blocked_records),
         },
     )
+
+
+def _window_blocked_overlay_records(
+    default_output: Any,
+    candidates: list[OverlayCandidate],
+    market_state: dict[str, Any],
+    config: dict[str, Any],
+    reasons: list[str],
+) -> list[dict[str, Any]]:
+    cfg = _v2b_cfg(config)
+    default_top5, keep_scores, keep_debug = _default_keep_scores(default_output, rrf_k=int(cfg.get("rrf_k", 60)))
+    records = []
+    for candidate in candidates:
+        if candidate.in_default_top5:
+            continue
+        target = candidate.replacement_target or (min(keep_scores, key=keep_scores.get) if keep_scores else None)
+        target_debug = keep_debug.get(str(target), {}) if target is not None else {}
+        score_margin = candidate.overlay_score - keep_scores.get(str(target), 0.0) if target is not None else candidate.replacement_gain_estimate
+        records.append(
+            _overlay_record(
+                candidate,
+                str(target) if target is not None else None,
+                target_debug,
+                market_state,
+                accepted=False,
+                guard_reasons=reasons,
+                score_margin=float(score_margin),
+                cfg=cfg,
+            )
+        )
+    return records
 
 
 def route_branch_v2b_overlay(
@@ -1224,8 +1476,13 @@ def route_branch_v2b_overlay(
     trend_window_score = _trend_window_score(metrics, state)
     theme_ai_window_score = _theme_ai_window_score(metrics, state)
     current_ret20_strength = _safe_float(metrics.get("current_aggressive", {}).get("selected_ret20_strength"), 0.0)
+    trend_dispersion = _safe_float(metrics.get("trend_uncluttered", {}).get("branch_score_dispersion_top10"), 0.0)
+    ai_metrics = metrics.get("ai_hardware_mainline_v1", {})
+    ai_consensus = _safe_float(ai_metrics.get("mean_consensus_support", ai_metrics.get("consensus_support")), 0.0)
     trend_window_cap_ok = current_ret20_strength <= float(cfg.get("trend_current_ret20_max", 0.12))
     theme_ai_window_cap_ok = current_ret20_strength <= float(cfg.get("theme_ai_current_ret20_max", 0.02))
+    trend_dispersion_cap_ok = trend_dispersion <= float(cfg.get("trend_dispersion_max", 0.14))
+    theme_ai_independence_ok = ai_consensus <= float(cfg.get("theme_ai_consensus_max", 0.70))
     debug = {
         "illegal_branch_filtered": illegal_filtered,
         "blocked_branches": blocked.copy(),
@@ -1237,8 +1494,13 @@ def route_branch_v2b_overlay(
         "current_aggressive_ret20_strength": current_ret20_strength,
         "trend_window_cap_ok": trend_window_cap_ok,
         "theme_ai_window_cap_ok": theme_ai_window_cap_ok,
+        "trend_dispersion": trend_dispersion,
+        "trend_dispersion_cap_ok": trend_dispersion_cap_ok,
+        "ai_consensus": ai_consensus,
+        "theme_ai_independence_ok": theme_ai_independence_ok,
         "full_tail_guard_rerank_used": False,
     }
+    state = {**state, "_router_trend_dispersion": trend_dispersion, "_router_theme_ai_consensus": ai_consensus}
 
     if bool(state.get("crash_mode", False)) and bool(cfg.get("crash_minrisk_enabled", True)) and "legal_minrisk_hardened" in filtered_outputs:
         return RouterDecision(
@@ -1256,25 +1518,48 @@ def route_branch_v2b_overlay(
         )
 
     overlay_candidates: list[OverlayCandidate] = []
-    if (
-        bool(cfg.get("trend_overlay_enabled", True))
-        and "trend_uncluttered" in filtered_outputs
-        and trend_window_score >= float(cfg.get("trend_window_threshold", 0.55))
-        and _safe_float(state.get("clutter_score"), 0.0) <= float(cfg.get("trend_clutter_max", 0.70))
-        and trend_window_cap_ok
-        and not bool(state.get("crash_mode", False))
-    ):
-        overlay_candidates.extend(build_overlay_candidates(filtered_outputs[default_branch], filtered_outputs["trend_uncluttered"], "trend_uncluttered", state, cfg))
-    if (
-        bool(cfg.get("theme_ai_overlay_enabled", True))
-        and "ai_hardware_mainline_v1" in filtered_outputs
-        and theme_ai_window_score >= float(cfg.get("theme_ai_window_threshold", 0.62))
-        and theme_ai_window_cap_ok
-        and not bool(state.get("crash_mode", False))
-    ):
-        overlay_candidates.extend(build_overlay_candidates(filtered_outputs[default_branch], filtered_outputs["ai_hardware_mainline_v1"], "ai_hardware_mainline_v1", state, cfg))
+    window_blocked_records: list[dict[str, Any]] = []
+    trend_window_reasons: list[str] = []
+    if bool(state.get("crash_mode", False)):
+        trend_window_reasons.append("crash_mode")
+    if trend_window_score < float(cfg.get("trend_window_threshold", 0.55)):
+        trend_window_reasons.append("trend_window_threshold_not_met")
+    if _safe_float(state.get("clutter_score"), 0.0) > float(cfg.get("trend_clutter_max", 0.70)):
+        trend_window_reasons.append("trend_clutter_too_high")
+    if not trend_window_cap_ok:
+        trend_window_reasons.append("trend_current_ret20_too_high")
+    if not trend_dispersion_cap_ok:
+        trend_window_reasons.append("trend_dispersion_too_high")
+    if bool(cfg.get("trend_overlay_enabled", True)) and "trend_uncluttered" in filtered_outputs:
+        trend_candidates = build_overlay_candidates(filtered_outputs[default_branch], filtered_outputs["trend_uncluttered"], "trend_uncluttered", state, cfg)
+        if trend_window_reasons:
+            window_blocked_records.extend(_window_blocked_overlay_records(filtered_outputs[default_branch], trend_candidates, state, cfg, trend_window_reasons))
+        else:
+            overlay_candidates.extend(trend_candidates)
+
+    theme_ai_window_reasons: list[str] = []
+    if bool(state.get("crash_mode", False)):
+        theme_ai_window_reasons.append("crash_mode")
+    if theme_ai_window_score < float(cfg.get("theme_ai_window_threshold", 0.62)):
+        theme_ai_window_reasons.append("theme_ai_window_threshold_not_met")
+    if not theme_ai_window_cap_ok:
+        theme_ai_window_reasons.append("theme_ai_current_ret20_too_high")
+    if not theme_ai_independence_ok:
+        theme_ai_window_reasons.append("theme_ai_consensus_too_high")
+    if bool(cfg.get("theme_ai_overlay_enabled", True)) and "ai_hardware_mainline_v1" in filtered_outputs:
+        ai_candidates = build_overlay_candidates(filtered_outputs[default_branch], filtered_outputs["ai_hardware_mainline_v1"], "ai_hardware_mainline_v1", state, cfg)
+        if theme_ai_window_reasons:
+            window_blocked_records.extend(_window_blocked_overlay_records(filtered_outputs[default_branch], ai_candidates, state, cfg, theme_ai_window_reasons))
+        else:
+            overlay_candidates.extend(ai_candidates)
 
     overlay = apply_candidate_overlay(filtered_outputs.get(default_branch), overlay_candidates, state, cfg)
+    overlay.debug_info["blocked_candidate_records"] = window_blocked_records + overlay.debug_info.get("blocked_candidate_records", [])
+    overlay.rejected_candidates = window_blocked_records[:20] + overlay.rejected_candidates
+    overlay.debug_info["guard_summary"] = _guard_summary(
+        overlay.debug_info.get("accepted_swap_records", []),
+        overlay.debug_info.get("blocked_candidate_records", []),
+    )
     route_reason = "candidate_overlay" if overlay.swap_count else "default_grr_tail_guard"
     used = overlay.source_branches_used
     return RouterDecision(
@@ -1297,6 +1582,9 @@ def route_branch_v2b_overlay(
                 "source_branches_used": used,
                 "overlay_reason": overlay.overlay_reason,
                 "rejected_candidates": overlay.rejected_candidates,
+                "accepted_swap_records": overlay.debug_info.get("accepted_swap_records", []),
+                "blocked_candidate_records": overlay.debug_info.get("blocked_candidate_records", []),
+                "guard_summary": overlay.debug_info.get("guard_summary", []),
                 "debug_info": overlay.debug_info,
             },
         },

@@ -6,11 +6,54 @@
 
 ## 当前状态
 
-当前阶段：`Phase 5 exp-002-11-final 完整训练复现已通过；Docker/提交打包检查中`
+当前阶段：`Phase 5 - 多专家融合 + regime 路由 + overlay 管道，Docker/提交打包检查中`
 
-当前主线：`Phase 1 稳固 baseline` -> `Phase 2 LightGBM 稳分分支` -> `Phase 3 GraphFormer 增量分支` -> `Phase 4 OOF 融合与提交优化`
+当前主线：`Phase 1 稳固 baseline` -> `Phase 2 LightGBM 稳分分支` -> `Phase 3 GraphFormer 增量分支` -> `Phase 4 OOF 融合与提交优化` -> `Phase 5 Docker 与提交`
 
-当前正式提交候选：`Transformer 0.30 / LGBM 0.70 + regime_liquidity_risk_off + equal`，阈值 `liquidity_quantile=0.10 / sigma_quantile=0.85`。
+当前正式推理管道：
+
+```text
+原始数据 → 特征工程（~270 维）
+       → StockTransformer 打分
+       → LGB Ranker（lambdarank）+ Regressor 打分，0.65/0.35 融合
+       → GRR Top5：RRF 多专家融合 + Hedge 在线路由 + Tail Guard 崩盘保护
+       → regime_liquidity_anchor_risk_off 过滤（extreme risk_off 时流动性锚定重排）
+       → branch_router_v2b overlay：趋势增强 → 主题增强 → 补充 overlay → 追涨否决
+       → Top5 等权输出
+```
+
+当前正式配置（`config.py`）：
+
+```text
+blend.transformer_weight = 0.30
+blend.lgb_weight = 0.70
+blend.score_mode = blend
+blend.normalize = zscore
+
+grr_top5.enabled = True
+grr_top5.expert_cols = [lgb_top5_score, lgb, transformer, score]
+grr_top5.candidate_k = 24
+grr_top5.rrf_k = 60
+grr_top5.rrf_weight = 0.45
+grr_top5.router_weight = 0.55
+grr_top5.tail_guard_enabled = True
+grr_top5.crash_guard_enabled = True
+grr_top5.high_risk_chaser_veto = True
+
+postprocess.filter = regime_liquidity_anchor_risk_off
+postprocess.weighting = equal
+postprocess.liquidity_quantile = 0.10
+postprocess.sigma_quantile = 0.85
+
+branch_router_v2b.enabled = True
+branch_router_v2b.default_branch = grr_tail_guard
+branch_router_v2b.trend_overlay_enabled = True
+branch_router_v2b.theme_ai_overlay_enabled = True
+branch_router_v2b.max_total_swaps = 2
+branch_router_v2b.supplemental_overlay_enabled = True
+branch_router_v2b.stress_chaser_veto_enabled = True
+branch_router_v2b.v2b_guarded_candidate.enabled = True
+```
 
 当前 `output/result.csv`：
 
@@ -19,8 +62,8 @@ stock_id,weight
 002384,0.2
 300274,0.2
 600015,0.2
-300750,0.2
 601077,0.2
+300750,0.2
 ```
 
 当前本地分数：
@@ -45,7 +88,7 @@ score_self.py = 0.12018139687305522
 local full runtime ≈ 34m53s
 ```
 
-下一步：进入 Docker 离线复现、计时和镜像导出检查。停止继续围绕当前 `score_self` 做新一轮搜索；`nofilter`、非等权、oracle 选股、Top5-heavy 直接替换和旧二阶段 reranker 均只保留为诊断记录，不进入提交逻辑。
+下一步：完成 Docker 离线复现、计时和镜像导出检查。
 
 ## 数据边界硬规则
 
@@ -121,8 +164,96 @@ score_first + leakage guardrail + complexity guardrail
 - 预训练模型：当前不使用；如未来使用，需要写明来源、开源时间、md5、初始化位置和报备状态。
 - 算法：整体思路、创新点、网络结构、损失函数、特征工程、模型集成、后处理与配权规则。
 - 训练流程：`train.py` 每一步做什么，包括数据读取、特征工程、标签构造、Transformer 训练、LightGBM 训练、产物保存。
-- 推理流程：`test.py` 每一步做什么，包括加载模型、特征构造、分数融合、过滤、配权、生成 `output/result.csv`。
+- 推理流程：`test.py` 每一步做什么，包括加载模型、特征构造、多专家融合、regime 过滤、overlay、配权、生成 `output/result.csv`。
 - 其他注意事项：验证集划分、OOF 仅用 `train.csv`、固定随机种子、离线复现、预测和训练耗时、文件大小控制。
+
+## 当前推理管道架构详解
+
+当前正式推理管道比最初的"Transformer + LGBM 简单 blend"复杂很多。以下完整描述从原始数据到最终 `result.csv` 的每一步逻辑。
+
+### Step 1：特征工程
+
+入口：`predict.py::preprocess_predict_data()` + `feature_registry.py`
+
+- 读取原始行情（收盘/开盘/最高/最低/成交额/换手率）
+- 多进程按股票分组构造 ~270 维特征，包括技术指标、横截面 rank/robust z-score、市场状态、相对强弱、动量和成交额变化
+- 按 `scaler.feature_names_in_` 对齐特征名，处理缺失和 inf
+- 用训练时保存的 `scaler.pkl` 标准化
+
+### Step 2：双模型打分
+
+**Transformer 分数**（`model.py::StockTransformer`）：
+- 构造 60 日输入序列 `[1, num_stocks, 60, 270]`
+- CUDA AMP 推理，输出每只股票的排序分数
+
+**LGB 分数**（`lgb_branch.py`）：
+- `lgb_rank_score`：LGBMRanker（lambdarank），`rank_weight=0.65`
+- `lgb_reg_score`：LGBMRegressor（regression），`reg_weight=0.35`
+- LGB 总分 = `0.65 * zscore(rank) + 0.35 * zscore(reg)`
+- 另有 `lgb_top5_score`（Top5-heavy LGBM Ranker V1），当前 `blend_weight=0.0` 不参与融合
+
+### Step 3：GRR Top5 多专家融合（`reranker.py::apply_grr_top5()`）
+
+以 Transformer 和 LGB 分数为基础，构建多专家融合系统：
+
+**候选池构建**：取各专家（`[lgb_top5_score, lgb, transformer, score]`）Top-24 股票的并集。
+
+**Reciprocal Rank Fusion（RRF）**：对候选池中每只股票，计算各专家排名的 RRF 分数：
+```
+grr_rrf_score = Σ 1/(k + rank_i)  （k=60）
+```
+
+**Hedge 在线路由器**：基于当日市场波动率和上涨宽度，动态调整各专家权重：
+- sigma20 分位 > 0.75 时，LGB 权重提升 20%
+- breadth > 0.50 时，Transformer 权重提升 15%
+- 权重按 `w_i ← w_i * exp(-η * loss_i)` 规则更新（η=0.50）
+
+**风险惩罚**：对候选池中每只股票叠加 sigma20、amp20、max_drawdown20 的分位惩罚。
+
+**最终融合分数**：
+```
+grr_final_score = 0.45 * zscore(rrf) + 0.55 * router_score - risk_penalty
+```
+
+**Tail Guard 崩盘保护**（`tail_guard_rerank()`）：
+- 使用当日合法特征推断市场崩盘状态（market_score、top_fragility、breadth）
+- 触发崩盘时：对高风险候选施加 sigma/amp/drawdown/共识度惩罚；对低风险高共识候选给予 bonus；对极端高风险低共识候选 veto 否决
+
+### Step 4：Regime 感知候选过滤（`portfolio_utils.py`）
+
+过滤策略 `regime_liquidity_anchor_risk_off`：
+
+**extreme risk_off 判断**：
+```
+median(ret20) < 0  AND  breadth20 < 0.45  AND  median(sigma20) > 0.018  AND  dispersion20 > 0.10
+```
+
+- **触发时**：取 stable top60（流动性 Q10 + 波动率 Q85 过滤），按流动性锚定重排分数重排后取 Top-5
+- **未触发时**：普通 stable 过滤（剔除流动性 Q10 以下、波动率 Q85 以上），按融合分数排序取 Top-5
+
+### Step 5：Branch Router V2B Overlay（`config['branch_router_v2b']`）
+
+在候选 Top-5 基础上，最多替换 2 只股票：
+
+**Trend Overlay**（`trend_overlay_enabled=True`，最多换 1 只）：
+- 触发条件：`breadth20 ≥ 0.55`，`dispersion20 ≤ 0.13`，候选 rank cap ≤ 6
+- 替换规则：替换分需领先 ≥ 0.04，替换后风险增量 ≤ 0.20，通过 sigma/amp/drawdown 分位上限检查
+
+**Theme AI Overlay**（`theme_ai_overlay_enabled=True`，最多换 1 只）：
+- 触发条件：`breadth20 ≥ 0.62`
+- 替换规则：替换分需领先 ≥ 0.08，候选 rank cap ≤ 3，通过冷却保护和风险上限检查
+
+**Supplemental Overlay**（`supplemental_overlay_enabled=True`，最多再换 1 只）：
+- `riskoff_fill_rank4_dynamic_defensive_target_no_v2b_swap`：当 Top-5 中有高风险标的时，用排名第 4 档低风险标的替换
+- `pullback_rebound_highest_risk`：市场短期回调但中期趋势在时，用回调反弹标的替换风险最高的一只
+
+**Stress Chaser Veto**（`stress_chaser_veto_enabled=True`，最多否决 1 只）：
+- 触发条件：`median(ret20) < 0`，`breadth20 < 0.50`，`median(sigma20) > 0.018`，`dispersion20 > 0.10`
+- 否决组合中的追涨型标的（`ret20 > 0` 且 `downside_beta60` 较高）
+
+### Step 6：输出
+
+Top-5 股票等权（各 0.2）输出 `output/result.csv`。若当日 breadth < 0.30，总仓位自动降至 0.7。
 
 ## 阶段总览
 
@@ -130,10 +261,10 @@ score_first + leakage guardrail + complexity guardrail
 |---|---|---|---|---|---|
 | Phase 0 | Done | 复制 baseline，新建独立仓库 | `THU-BDC2026-solution/` | 仓库可运行 | 保留 baseline 只作对照 |
 | Phase 1 | Done | 修样本口径、加横截面特征、补赛事入口、改推理权重 | `best_model.pth`、`scaler.pkl`、`final_score.txt`、`result.csv` | `final_score=0.037838` | 作为 Phase 2 对照基线 |
-| Phase 2 | Done | 加入 LightGBM Ranker + Regressor，并完成合法组合层验证、推理缓存优化和正式推理评测 | `lgb_ranker.pkl`、`lgb_regressor.pkl`、`lgb_features.json`、`lgb_report.json`、`exp-002-05_val_grid.csv` | exp-002-05: `final_score=0.050761`, `validation_mean_return=0.024583`, `score_self=0.096318` | 先做 OOF 稳健性确认 |
+| Phase 2 | Done | 加入 LightGBM Ranker + Regressor，并完成合法组合层验证、推理缓存优化和正式推理评测 | `lgb_ranker.pkl`、`lgb_regressor.pkl`、`lgb_features.json`、`lgb_report.json` | exp-002-05: `final_score=0.050761`, `score_self=0.096318` | 先做 OOF 稳健性确认 |
 | Phase 3 | Todo | 将 dense CrossStockAttention 升级为动态图 GraphFormer | `graphformer_*.pth`、图配置、验证报告 | 待填写 | OOF 后开始 |
-| Phase 4 | Done | score-equivalent OOF、融合权重搜索、stable top30 诊断、Top5-heavy 分支和 reranker 诊断 | `exp-002-06_oof_grid.csv`、`exp-002-07_profile_*.csv`、`exp-002-08_oof_summary.csv`、`exp-002-09_oof_summary.csv`、`lgb_ranker_top5_v*.pkl` | `nofilter`、非等权、Top5-heavy 直接替换和二阶段 reranker 均未超过最终候选；旧保护线为 `score_self=0.09719554955415999` | 停止扩搜 |
-| Phase 5 | In Progress | score-first 最终候选、完整训练复现、Docker 复现、镜像导出、提交前检查 | `regime_liquidity_risk_off`、`output/result.csv`、`docs/EXP_002_11_FINAL_REPORT.md`、官方 `app/` 结构 | 完整 `train -> predict -> score_self` 已复现 `score_self=0.12018139687305522`；leakage audit 与 risk_off 阈值敏感性已通过 | 完成 Docker build、计时、导出 |
+| Phase 4 | Done | 多专家融合（RRF + Hedge）、regime 感知路由、OOF 诊断、保护线冻结 | `reranker.py`、`portfolio_utils.py`、`branch_router.py`、`score_self=0.12018` | GRR Top5 + regime_liquidity_anchor_risk_off + overlay 通过 leakage audit、阈值敏感性检查和完整训练复现 | Docker 打包 |
+| Phase 5 | In Progress | 完整推理管道固化、Docker 复现、镜像导出、提交前检查 | `regime_liquidity_anchor_risk_off` + `branch_router_v2b` + `output/result.csv` | 完整 `train → predict → score_self` 已复现 `score_self=0.12018139687305522`；leakage audit 与 risk_off 阈值敏感性已通过 | Docker build、计时、导出 |
 
 状态约定：
 
@@ -154,155 +285,92 @@ score_first + leakage guardrail + complexity guardrail
 | exp-002-03-final | 2026-04-23 | Phase 2 正式推理 | 不重训 | `uv run python app/code/src/test.py` | 固定 exp-002-03 配置后只做最终本地评测 | `0.05757693442603892` | `601899/603799/002384/600362/002463`, 等权 `0.2` | 正式 `predict.py`: `Transformer 0.30 / LGBM 0.70 + stable + equal` |
 | exp-002-04 | 2026-04-23 | Phase 2 超参 + 特征 | `uv run python app/code/src/train.py` | `uv run python app/code/src/test.py` | LGBM 搜索：nl63_mcs32_lr0.03, `lgb_valid=0.2739` | `0.0438415113972748` | 待填写 | 特征增强实现有问题，分数下降，需修复 |
 | exp-002-05 | 2026-04-24 | Phase 2 链路修复 + 重训 | `uv run python app/code/src/train.py` | 不重训 | `best_epoch=8`, `final_score=0.050761`, `lgb_valid=0.266464` | 空 | 待填写 | 修复训练/推理特征增强断链，特征数 `270`；LGBM 搜索最优 `nl127_mcs32_lr0.05` |
-| exp-002-05-val | 2026-04-24 | Phase 2 组合层复验 | 不重训 | `uv run python code/src/experiment_blend.py --mode validation --output temp/exp-002-05_val_grid.csv` | `validation_mean_return=0.024583` | 空 | 验证末日 `31/94/83/198/163`, `0.0688/0.4728/0.0773/0.3730/0.0081` | 单验证段最优：`Transformer 0.50 / LGBM 0.50 + nofilter + risk_soft`；集中度较高，需 OOF 复核 |
-| exp-002-05-oof | 2026-04-24 | Phase 4 OOF 诊断 | 不重训 | `uv run python code/src/experiment_blend.py --mode oof --n_folds 4 --output temp/exp-002-05_oof_combo_grid.csv` | top: `oof_mean_return=0.101607`, `oof_min_return=0.019936` | 临时采用 OOF top 后 `0.02802897105714421`，仅作诊断 | `002463/600362/600015/601888/002384`, `0.4848/0.3593/0.1308/0.0136/0.0116` | 真 OOF 已跑通；top 为 `Transformer 0.20 / LGBM 0.80 + penalty 0.20 + stable + risk_soft`，权重集中且正式检查下降，暂不采纳 |
-| exp-002-05-final | 2026-04-24 | Phase 2 正式推理 | 不重训 | `uv run python app/code/src/test.py` | 当前正式配置 `Transformer 0.30 / LGBM 0.70 + stable + equal` | `0.09631811495423051` | `002463/600362/600015/002384/300274`, 等权 `0.2` | 已接入推理缓存、单次线性序列/风险构造、CUDA AMP；首轮生成 `predict_artifacts_ffe825d76fed7cdb.pkl` |
-| exp-002-06 | 2026-04-24 | Phase 4 score-equivalent OOF | 不重训 | `uv run python code/src/experiment_blend.py --mode oof --n_folds 4 --fold_window_months 1 --gap_months 1 --weights 0.2,0.3,0.4,0.5 --penalties 0,0.1 --output temp/exp-002-06_oof_grid.csv` | constrained top: `0.106286`; stable equal best: `0.098768`; current formal stable equal: `0.093083` | 正式保护线复验 `0.09631811495423051` | 正式仍为 `002463/600362/600015/002384/300274`, 等权 `0.2` | 修复 OOF 评分口径：真实股票代码 join、未来 5 条开盘收益、逐日 z-score、集中度指标、calibration 输出；裸 `risk_soft` top 虽高但 `constraint_pass_rate=0` |
-| exp-002-07 | 2026-04-24 | Phase 4 stable top30 profile | 不重训 | 生成 `temp/candidate_results/reranker_rules/exp-002-07_profile_focus.csv` 与 `exp-002-07_profile_all.csv` | 当前 Top5 `0.09719555`；stable top30 oracle `0.17714111`；all-market oracle `0.21674024` | 诊断 only | 当前 Top5 `600015/601018/601077/002384/300274`；stable top30 oracle `002384/002709/300274/688472/300750` | oracle 使用 test future return，只用于定位 cutoff error，不进入提交逻辑 |
-| exp-002-08 | 2026-04-24 | Phase 4 规则型 stable top30 reranker | 不重训 | 生成 `temp/candidate_results/reranker_rules/exp-002-08_oof_summary.csv` | R0_fused OOF mean `0.097805` 最好；R1-R4 均未胜出 | 规则诊断未替换保护线 | 仍保留保护线 Top5 `600015/601018/601077/002384/300274` | 规则特征仅用一阶段分数、历史收益、流动性、波动、回撤和分歧；结果不足以替换 R0 |
-| exp-002-09 | 2026-04-24 | Phase 4 小 LightGBM reranker | 不重训 | 生成 `temp/candidate_results/lgbm_reranker/exp-002-09_oof_summary.csv` | regressor OOF mean `0.095715`；ranker OOF mean `0.095357` | 当前诊断 regressor `0.075557`、ranker `0.032326` | 未采用 | 二阶段小模型未超过规则保护线，停止 reranker 主线 |
-| exp-002-10-final | 2026-04-24 | Phase 4 最终保护线 | 不重训 | `uv run python app/code/src/test.py` | 固定 `Transformer 0.30 / LGBM 0.70 + stable + equal`，`liquidity_quantile=0.10`，`sigma_quantile=0.85` | `0.09719554955415999` | `600015/601018/601077/002384/300274`, 等权 `0.2` | 正式提交保护线；不采用 nofilter、非等权、oracle 或 reranker |
-| exp-002-11-final | 2026-04-25 | Phase 5 score-first 最终候选 | `uv run python app/code/src/train.py` | `uv run python app/code/src/test.py` | 完整训练复现通过；`Best epoch=8`, `Best final_score=0.050761`, runtime≈34m53s | `0.12018139687305522` | `002384/300274/600015/300750/601077`, 等权 `0.2` | 当前正式提交；risk-off 使用 stable top60 + fused/lgb/liquidity/momentum/amp/negative_ret20 rerank |
+| exp-002-05-final | 2026-04-24 | Phase 2 正式推理 | 不重训 | `uv run python app/code/src/test.py` | 当前正式配置 `Transformer 0.30 / LGBM 0.70 + stable + equal` | `0.09631811495423051` | `002463/600362/600015/002384/300274`, 等权 `0.2` | 已接入推理缓存、线性序列/风险构造、CUDA AMP |
+| exp-002-06 | 2026-04-24 | Phase 4 score-equivalent OOF | 不重训 | `uv run python code/src/experiment_blend.py --mode oof --n_folds 4 ...` | constrained top: `0.106286`; stable equal best: `0.098768`; current formal stable equal: `0.093083` | 正式保护线复验 `0.09631811495423051` | 诊断 only | 修正 OOF 口径：真实 stock_id/date join、scorer-equivalent future return、集中度指标 |
+| exp-002-07 | 2026-04-24 | Phase 4 stable top30 profile | 不重训 | stable top30 oracle 诊断 | stable top30 oracle `0.17714111` | 诊断 only | 当前 Top5 `0.09719555`；oracle 说明候选池召回足够，主要问题是 cutoff/rerank | oracle 使用 test future return，不进入提交逻辑 |
+| exp-002-08 | 2026-04-24 | Phase 4 规则型 reranker | 不重训 | 规则型 stable top30 reranker OOF 诊断 | R0_fused OOF mean `0.097805` 最好 | 诊断 only | 趋势、防守、LGBM 锚定和边界修正规则均未稳定超过 R0 | 未采用 |
+| exp-002-09 | 2026-04-24 | Phase 4 小 LGBM reranker | 不重训 | 小 LightGBM reranker OOF 诊断 | regressor/ranker OOF mean `0.095715/0.095357` | 诊断 only | 未超过保护线 | 未采用 |
+| exp-002-10-final | 2026-04-24 | Phase 4 最终保护线 | 不重训 | `uv run python app/code/src/test.py` | 固定 `Transformer 0.30 / LGBM 0.70 + stable + equal` | `0.09719554955415999` | `600015/601018/601077/002384/300274`, 等权 `0.2` | 正式提交保护线 |
+| exp-002-11-final | 2026-04-25 | Phase 5 score-first 最终候选 | `uv run python app/code/src/train.py` | `uv run python app/code/src/test.py` | 完整训练复现通过；`Best epoch=8`, `Best final_score=0.050761`, runtime≈34m53s | `0.12018139687305522` | `002384/300274/600015/300750/601077`, 等权 `0.2` | 当前正式提交；risk-off 使用 stable top60 + 流动性锚定重排 |
 | exp-003 | 待填写 | Phase 3 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | GraphFormer |
-| exp-004 | 待填写 | Phase 4 | 待填写 | 待填写 | 待填写 | 待填写 | 待填写 | OOF 融合 |
 
-Phase 1 `result.csv` 快照：
+## 已实现的关键模块
 
-```csv
-stock_id,weight
-600023,0.2
-601668,0.2
-601018,0.2
-601818,0.2
-601186,0.2
-```
+以下模块在当前正式推理管道中处于启用状态（`config.py` 中 `enabled=True`）。
 
-Phase 2 `lgb_report.json` 快照：
+### 多专家融合系统（`reranker.py`）
 
-```json
-{
-  "rank_best_iteration": 854,
-  "reg_best_iteration": 4,
-  "valid_final_score": 0.27971309242085596,
-  "num_features": 253,
-  "num_train_rows": 143690,
-  "num_valid_rows": 27000
-}
-```
+以 Transformer 和 LGB 分数为基础，构建多专家打分变体（`score`/`lgb`/`transformer`/`lgb_top5_score`），通过以下机制融合：
 
-Phase 2 `result.csv` 快照：
+- **union-topK 候选池**：各专家 Top-24 股票并集（`candidate_k=24`）
+- **RRF（Reciprocal Rank Fusion）**：对候选池中每只股票计算各专家排名的 RRF 分数（`rrf_k=60`）
+- **Hedge 在线路由器**：根据当日市场 sigma20 分位和上涨宽度动态调整 Transformer/LGB 权重（`hedge_eta=0.50`）
+- **风险惩罚**：对 sigma20、amp20、max_drawdown20 的横截面分位施加惩罚
+- **最终分数**：`grr_final_score = 0.45 * zscore(rrf) + 0.55 * router_score - risk_penalty`
 
-```csv
-stock_id,weight
-300502,0.2
-600489,0.2
-300308,0.2
-603993,0.2
-300394,0.2
-```
+### Tail Guard 崩盘保护（`reranker.py`）
 
-Phase 2 消融备注：
+使用当日合法历史特征（`compute_market_crash_state()`）推断市场是否处于崩盘状态：
 
-- 当前默认融合 `Transformer 0.55 / LGBM 0.45` 的本地分数是 `0.0044263938292461585`。
-- 旧版 exp-002-02 曾用 `data/test.csv` 扫融合权重，属于测试集泄漏，只能作为问题诊断，不能用于选配置。
-- `risk_soft` 经常退化成等权，原因是 `cap=0.35` 截断后再归一化，Top5 权重容易全部变成 `0.2`。
-- 当前问题重点不是训练是否跑通，而是验证代理、融合权重和组合后处理与最终 `score_self.py` 目标不一致。
-- 合法 exp-002-03 只使用 `train.csv` 内部验证段，当前最优配置为 `Transformer 0.30 / LGBM 0.70 + stable filter + equal weight`，验证段平均组合收益 `0.027449`。这可以作为下一次正式推理配置候选，但仍需先讨论是否直接写入 `predict.py`。
-- exp-002-05 已修复特征增强断链：训练、验证、推理现在共享同一套特征列扩展逻辑，最终特征数从 exp-002-04 的 `253` 提升到 `270`。
-- exp-002-05 最新重训完成后，Transformer 最佳验证 `final_score=0.050761`，较 Phase 1 基线 `0.037838` 有提升，也高于上一轮 exp-002-05 的 `0.0471`。
-- exp-002-05 LGBM 搜索最优为 `num_leaves=127, min_child_samples=32, learning_rate=0.05`，验证 `valid_final_score=0.266464`，特征数为 `270`。
-- exp-002-05 组合层复验显示，单验证段最优为 `Transformer 0.50 / LGBM 0.50 + nofilter + risk_soft`，`validation_mean_return=0.024583`；但该配置权重集中且去掉稳定过滤，暂不直接替换正式配置，需 OOF 复核。
-- exp-002-05 的 `experiment_blend.py --mode oof` 已从 fallback 改为真正 walk-forward OOF，并完成 4 折组合网格；OOF top 为 `Transformer 0.20 / LGBM 0.80 + agreement_penalty 0.20 + stable + risk_soft`，`oof_mean_return=0.101607`。
-- OOF top 配置生成的权重过度集中，临时正式检查为 `002463/600362/600015/601888/002384`，权重 `0.4848/0.3593/0.1308/0.0136/0.0116`，`score_self.py=0.02802897105714421`。该结果只作为 OOF 代理风险诊断，不用于反向调参；正式配置已恢复为 `stable + equal`。
-- exp-002-06 按 Pro 建议修正 OOF 口径：使用真实 6 位股票代码显式 join，不再用 instrument index 或裸数组索引；OOF 收益改为 scorer-equivalent 的 `open[t+5] / open[t+1] - 1`；融合 z-score 改为逐预测日横截面；风险特征改为标准化前原始行情计算。
-- exp-002-06 新增集中度与校准诊断：输出 `win_rate_vs_equal`、`avg_max_weight`、`avg_top2_weight`、`avg_herfindahl`、`avg_entropy_effective_n`、`constraint_pass_rate`，并保存 `temp/exp-002-06_oof_grid_calibration.csv`。裸 `risk_soft` OOF top 仍高，但 `constraint_pass_rate=0`、`avg_top2_weight≈0.80`，暂不采纳。
-- exp-002-06 在 `stable` 过滤下，约束版 `shrunk_t3_rho20_cap35_min05` 仅小幅高于 equal：`0.099426` vs `0.098768`；优势不够大，正式配置继续保持 equal。
-- 由于比赛真实目标以 `score_self.py` 为准，后续重点转为 stable 阈值与 Top5 边界诊断。`nofilter` 在本地评分中显著低于 stable 主线，停止作为正式候选。
-- exp-002-07 stable top30 oracle 诊断显示：当前 Top5 为 `600015/601018/601077/002384/300274`，`score_self=0.09719555`；stable top30 oracle 可到 `0.17714111`，说明候选池召回足够，主要问题是候选池内 cutoff/rerank。但 oracle 使用 test future return，不能进入提交逻辑。
-- exp-002-08 规则型 stable top30 reranker 中，R0_fused OOF mean `0.097805` 最好，趋势、防守、LGBM 锚定和边界修正规则均未稳定超过 R0，未采用。
-- exp-002-09 小 LightGBM reranker 中，regressor/ranker OOF mean 分别为 `0.095715/0.095357`，当前诊断分数也低于保护线，未采用。
-- exp-002-10 保护线为 `Transformer 0.30 / LGBM 0.70 + stable + equal`，阈值 `liquidity_quantile=0.10`、`sigma_quantile=0.85`，本地 `score_self.py=0.09719554955415999`。该版本已作为回滚文件保留。
-- 当前正式推理使用 `Transformer 0.30 / LGBM 0.70 + regime_liquidity_risk_off + equal`，完整 `train -> predict -> score_self` 本地复现 `score_self.py=0.12018139687305522`。该规则经过 GPT Pro 审核、代码级 leakage audit、risk_off 阈值敏感性复核和完整训练复现后冻结；后续不再围绕当前 `score_self` 继续迭代。
+- **market_score**：综合 breadth_1d/5d、median_ret1/5、high_vol/amp/dd_ratio 的加权评分
+- **top_fragility_score**：当前 Top-5 候选的 sigma/amp/drawdown/极端收益/共识度加权评分
+- **risk_off_score** = 0.62 × market_score + 0.38 × top_fragility_score
+
+触发崩盘（`crash_mode=True`）后，对高风险候选施加风险惩罚，对低风险高共识候选给予 bonus，对极端高风险低共识候选 veto 否决。
+
+### Regime 感知过滤（`portfolio_utils.py`）
+
+`regime_liquidity_anchor_risk_off` 过滤策略：
+
+- **extreme risk_off 判断**：`median(ret20) < 0 AND breadth20 < 0.45 AND median(sigma20) > 0.018 AND dispersion20 > 0.10`
+- **触发时**：stable top60 + 流动性锚定重排（融合分 + 流动性 + 动量 + 低波动 + 低振幅）
+- **未触发时**：stable 过滤（流动性 Q10 以上 + 波动率 Q85 以下），按原始融合分数排序
+
+### Branch Router V2B Overlay（`branch_router.py` + `portfolio_utils.py`）
+
+当前正式版本 `v2b`（`enabled=True`，`max_total_swaps=2`）包含三层 overlay 和一层 veto：
+
+| 层 | 触发条件 | 最多替换数 | 替换规则 |
+|---|---|---|---|
+| Trend Overlay | `breadth20 ≥ 0.55`，`dispersion20 ≤ 0.13` | 1 | 替换分领先 ≥ 0.04，风险增量 ≤ 0.20 |
+| Theme AI Overlay | `breadth20 ≥ 0.62` | 1 | 替换分领先 ≥ 0.08，候选 rank ≤ 3，冷却保护 |
+| Supplemental Overlay | riskoff 或 pullback 触发 | 1 | riskoff：rank4 低风险标的替换高风险；pullback：回调反弹标的替换最高风险 |
+| Stress Chaser Veto | `median(ret20) < 0`，`breadth20 < 0.50` | 1 | 否决追涨型标的（`ret20 > 0` 且 `downside_beta60` 高） |
+
+已探索但未采用的版本：
+- `v1`（`enabled=False`）：基于规则的 regime 路由，分支含 `current_aggressive`/`trend_uncluttered`/`legal_minrisk_hardened` 等
+- `v2a`（`enabled=False`）：trend/theme_ai override，直接全量替换
+
+### 风险特征构建（`features.py`）
+
+推理时额外构建以下风险/状态特征，用于路由、过滤和 overlay：
+
+| 特征 | 计算方式 |
+|---|---|
+| `sigma20` | 20 日每日收益标准差 |
+| `amp20` | 20 日最高-最低 / 收盘 |
+| `beta60` | 60 日个股 vs 市场 beta |
+| `downside_beta60` | 仅下跌日的 beta |
+| `idio_vol60` | 60 日残差波动率（去掉 beta 后的个股特异波动） |
+| `max_drawdown20` | 20 日收盘价最大回撤 |
+| `pos20` | 20 日收盘价在高-低区间的位置 |
+| `amt_ratio5` | 5 日平均成交额 / 20 日平均成交额 |
+| `to_ratio5` | 5 日平均换手率 / 20 日平均换手率 |
+
+## 历史备注
+
+- Phase 1 修复 baseline 样本口径：标签改为未来第 1 到第 5 个交易日开盘收益，不再错误要求未来自然日连续。
+- Phase 2 exp-002-02 使用 `data/test.csv` 扫融合权重，属于测试集泄漏，只作为问题诊断，标记为 Invalid。
+- Phase 2 exp-002-04 特征增强实现有断链问题（训练/推理特征列不一致），在 exp-002-05 修复，特征数从 253 提升到 270。
+- Phase 4 exp-002-06 修正 OOF 口径：真实股票代码 join、逐日 z-score、scorer-equivalent future return、集中度指标。裸 `risk_soft` OOF top 虽高但 `constraint_pass_rate=0`、`avg_top2_weight≈0.80`，暂不采纳。
+- Phase 4 exp-002-07 stable top30 oracle 诊断显示：当前 Top5 `score_self=0.09719555`；stable top30 oracle `0.17714111`；说明候选池召回足够，主要问题是候选池内 cutoff/rerank。但 oracle 使用 test future return，不能进入提交逻辑。
+- Phase 4 exp-002-08/09 规则型/LGBM reranker 均未超过保护线，未采用。
+- Phase 4 exp-002-10 保护线为 `Transformer 0.30 / LGBM 0.70 + stable + equal`，`score_self=0.09719554955415999`，已作为回滚文件保留。
+- Phase 5 exp-002-11 完整训练复现通过，当前正式推理接入多专家融合 + regime 路由 + overlay，`score_self=0.12018139687305522`。
 - 推理端已补充自动创建输出目录、特征/序列/风险缓存、按 `scaler.feature_names_in_` 对齐特征、单次线性序列/风险构造和 CUDA AMP。当前首轮推理会生成 `temp/predict_artifacts_*.pkl`，重复推理可跳过重特征工程。
-
-Phase 2 exp-002-03 固定候选配置：
-
-```text
-blend.transformer_weight = 0.30
-blend.lgb_weight = 0.70
-postprocess.filter = stable
-postprocess.weighting = equal
-validation_metric = mean daily top5 weighted return
-validation_mean_return = 0.027449
-data_boundary = train.csv internal validation only
-```
-
-Phase 2 exp-002-03-final `result.csv` 快照：
-
-```csv
-stock_id,weight
-601899,0.2
-603799,0.2
-002384,0.2
-600362,0.2
-002463,0.2
-```
-
-Phase 2 exp-002-05-final `result.csv` 快照：
-
-```csv
-stock_id,weight
-002463,0.2
-600362,0.2
-600015,0.2
-002384,0.2
-300274,0.2
-```
-
-Phase 4 exp-002-10-final `result.csv` 快照：
-
-```csv
-stock_id,weight
-600015,0.2
-601018,0.2
-601077,0.2
-002384,0.2
-300274,0.2
-```
-
-Phase 4 exp-002-05-oof top 诊断快照：
-
-```text
-command = uv run python code/src/experiment_blend.py --mode oof --n_folds 4 --output temp/exp-002-05_oof_combo_grid.csv
-top_config = Transformer 0.20 / LGBM 0.80 + agreement_penalty 0.20 + stable + risk_soft
-oof_mean_return = 0.101607
-oof_min_return = 0.019936
-adoption_status = not adopted; risk_soft concentration too high and formal diagnostic score dropped
-```
-
-Phase 4 exp-002-06 score-equivalent OOF 诊断快照：
-
-```text
-command = uv run python code/src/experiment_blend.py --mode oof --n_folds 4 --fold_window_months 1 --gap_months 1 --weights 0.2,0.3,0.4,0.5 --penalties 0,0.1 --output temp/exp-002-06_oof_grid.csv
-scoring = explicit stock_id/date join + open[t+5] / open[t+1] - 1
-top_unconstrained = risk_soft, oof_mean_return ~ 0.125449, constraint_pass_rate = 0
-top_constrained = shrunk_t3_rho20_cap35_min05, oof_mean_return = 0.106286, avg_top2_weight = 0.421681, avg_herfindahl = 0.200570
-stable_equal_best = Transformer 0.20 / LGBM 0.80 + penalty 0.00 + stable + equal, oof_mean_return = 0.098768
-current_formal_at_that_time = Transformer 0.30 / LGBM 0.70 + penalty 0.00 + stable + equal, oof_mean_return = 0.093083, score_self = 0.096318
-adoption_status = diagnostic only; formal config unchanged
-```
-
-Phase 4 exp-002-07/08/09 stable top30 reranker 诊断快照：
-
-```text
-candidate_generator = stable top30
-current_top5 = 600015/601018/601077/002384/300274, score_self = 0.09719554955415999
-stable_top30_oracle = 002384/002709/300274/688472/300750, score_self = 0.17714111, diagnostic only
-all_market_oracle = 601868/002384/605117/002709/300274, score_self = 0.21674024, diagnostic only
-rule_reranker = R0_fused best, oof_mean = 0.097805, R1-R4 not adopted
-lgbm_reranker = regressor/ranker oof_mean = 0.095715/0.095357, not adopted
-final_adoption = keep stable threshold protection line; no oracle, no reranker
-```
+- Phase 3 GraphFormer 仍为 Todo，`CrossStockAttention` 已在 `StockTransformer` 中作为股票间交互模块使用，但动态图版本尚未实现。
+- `selector` 系统（`config['selector']`，含 `independent_union_rerank`/`safe_union_2slot`/`legal_plus_1alpha` 等多分支 + combo search + risk budget + meta gate）已实现但当前 `enabled=False`，仅在 `score_mode='selector'` 时启用，可作为后续扩展。
+- `exp009_meta`（OOF bad-aware 元排名器）已实现（`exp009_meta.py`/`exp009_oof_builder.py`/`exp009_runtime.py`）但当前 `enabled=False`。
 
 ## Todo 清单
 
@@ -329,23 +397,11 @@ final_adoption = keep stable threshold protection line; no oracle, no reranker
 - [x] 运行 `uv run python test/score_self.py`。
 - [x] 将 Phase 2 分数和 `result.csv` 补进实验记录表。
 - [x] 只使用训练集内部验证段调整融合权重和后处理。
-- [x] 检查权重优化被 `cap=0.35` 全部截断导致最终等权的问题。
-- [x] 新增 `code/src/experiment_blend.py`，用于不重训扫描融合权重和后处理。
-- [x] 将旧 exp-002-02 标记为 Invalid，因为它使用了 `data/test.csv` 调参。
 - [x] 完成合法 exp-002-03：只使用 `train.csv` 内部验证段搜索组合层。
-- [x] 暂停使用不稳定的 `risk_soft`，exp-002-03 暂定等权。
-- [x] 将 exp-002-03 的最优验证配置写入正式 `predict.py`。
-- [x] 运行最终本地评测，`score_self.py=0.05757693442603892`。
-- [x] 给 `predict.py`、`score_self.py`、`experiment_blend.py` 输出增加 `[BDC]` 标号。
 - [x] 修复 exp-002-04 暴露出的特征增强断链问题，统一训练/验证/推理特征列注册。
-- [x] 修复正式推理输出目录不存在时 `result.csv` 写入失败的问题。
-- [x] 为 4090 服务器增加 AMP、DataLoader 和 batch size 调优入口。
 - [x] 完成 exp-002-05 最新重训，`best_epoch=8`, `final_score=0.050761`。
-- [x] 完成 exp-002-05 训练集内部组合层复验，单验证段最优配置为 `Transformer 0.50 / LGBM 0.50 + nofilter + risk_soft`。
 - [x] 完成 exp-002-05 正式本地评测，`score_self.py=0.09631811495423051`。
 - [x] 优化推理效率：新增推理缓存、线性构造序列/风险特征、AMP 推理和特征名兼容逻辑。
-- [x] 将 `experiment_blend.py --mode oof` 从 fallback 到 validation 改成真正 walk-forward OOF。
-- [x] 新增 `portfolio_utils.py` 统一过滤、配权、scorer-equivalent forward return 和集中度指标。
 
 ### Phase 3：GraphFormer 增量分支
 
@@ -357,15 +413,14 @@ final_adoption = keep stable threshold protection line; no oracle, no reranker
 - [ ] 跑一版 GraphFormer 与 Phase 2 对比。
 - [ ] 更新实验记录表。
 
-### Phase 4：OOF 融合与提交优化
+### Phase 4：多专家融合与 Regime 路由
 
-- [x] 实现 3 折或 4 折 walk-forward。
-- [x] 保存每个分支 OOF 分数。
-- [x] 搜索 `Transformer / LGBM` 融合权重。
-- [x] 修正 OOF 组合代理：真实股票代码 join、逐日 z-score、scorer-equivalent future open return、集中度指标。
-- [x] 增加 score calibration 诊断，输出 `exp-002-06_oof_grid_calibration.csv`。
-- [x] 增加 shrink-to-equal constrained allocation 候选。
-- [x] 基于真实评分目标停止 constrained non-equal 主线；正式配置保持 equal。
+- [x] 实现 RRF（Reciproral Rank Fusion）多专家融合（`reranker.py`）。
+- [x] 实现 Hedge 在线路由器，根据市场状态动态调整 Transformer/LGB 权重。
+- [x] 实现 Tail Guard 崩盘保护（market_score + top_fragility + veto）。
+- [x] 实现 `regime_liquidity_anchor_risk_off` 过滤策略（`portfolio_utils.py`）。
+- [x] 实现 3 折或 4 折 walk-forward OOF（`experiment_blend.py`）。
+- [x] 修正 OOF 组合代理：真实股票代码 join、逐日 z-score、scorer-equivalent future return、集中度指标。
 - [x] 完成 stable 阈值更新，正式保护线提升到 `score_self.py=0.09719554955415999`。
 - [x] 完成 exp-002-07 stable top30 profile / oracle 诊断。
 - [x] 完成 exp-002-08 规则型 reranker OOF 诊断，未采用。
@@ -374,6 +429,9 @@ final_adoption = keep stable threshold protection line; no oracle, no reranker
 - [x] 完成 GPT Pro score-first 审核，接受 `regime_liquidity_risk_off` 作为当前提交候选。
 - [x] 完成代码级 leakage audit。
 - [x] 完成 risk_off 阈值敏感性复核。
+- [x] 实现 branch_router_v2b overlay（趋势增强 + 主题增强 + 补充 overlay + 追涨否决）。
+- [x] 实现 `selector` 多分支系统（`independent_union_rerank`/`safe_union_2slot`/`legal_plus_1alpha` + combo search + risk budget + meta gate），当前 `enabled=False`。
+- [x] 实现 `exp009_meta`（OOF bad-aware 元排名器），当前 `enabled=False`。
 - [ ] 将 GraphFormer 接入 OOF 搜索后，扩展为 `Transformer / LGBM / GraphFormer` 融合权重。
 - [ ] 增加相关性去重。
 - [ ] 优化仓位上限、单票权重上限和现金留存规则。
@@ -395,11 +453,23 @@ final_adoption = keep stable threshold protection line; no oracle, no reranker
 - [ ] 固定随机种子后，从训练开始复现，结果与目标榜单结果误差保持在 `+-0.002` 内。
 - [ ] 镜像、代码、数据、模型和环境总大小小于 `10G`，且不依赖压缩包运行。
 - [ ] 若使用外部开源数据、词典、embedding 或预训练模型，确认已在 `7月18日` 前向 `data@tsinghua.edu.cn` 报备链接和 md5。
-- [ ] 当前若不使用外部数据或预训练模型，在提交版 `readme.md` 中明确写明“未使用外部数据和预训练模型”。
+- [ ] 当前若不使用外部数据或预训练模型，在提交版 `readme.md` 中明确写明"未使用外部数据和预训练模型"。
 - [x] `output/result.csv` 格式校验通过。
 - [x] `weight` 总和小于等于 1。
 - [ ] 镜像导出为 `.tar`。
 - [ ] 用官方/本地 Docker 测试脚本完成最终验证。
+
+## 方案主线
+
+最终方案保持四阶段结构。
+
+**第一阶段：特征层**：保留 baseline 的量价、技术指标和 Alpha 特征，新增横截面 rank、robust z-score、市场状态、相对强弱、流动性和风险特征。排序任务本质是同日横截面比较，所以这些特征优先级高于盲目扩大模型。
+
+**第二阶段：模型层**：保留 `StockTransformer` 作为可复现神经 baseline（3层，256维，cross-stock attention）；加入 LightGBM Ranker / Regressor 双分支作为稳分底座（lambdarank 0.65 + regression 0.35）；后续再加入动态相关图 GraphFormer，增强股票间结构建模。
+
+**第三阶段：融合层**：推理时对 Transformer 分数和 LGB 分数分别做横截面 z-score，通过 RRF 多专家融合 + Hedge 在线路由器 + Tail Guard 崩盘保护生成 `grr_final_score`。
+
+**第四阶段：组合层**：在候选池上依次执行 regime 感知过滤（extreme risk_off 时流动性锚定重排）、branch_router_v2b overlay（趋势/主题增强 + 补充 overlay + 追涨否决），最终 Top5 等权输出 `output/result.csv`。
 
 ## 常用命令
 
@@ -407,7 +477,7 @@ final_adoption = keep stable threshold protection line; no oracle, no reranker
 
 ```bash
 uv sync
-uv run python -m py_compile code/src/utils.py code/src/train.py code/src/predict.py code/src/lgb_branch.py app/code/src/train.py app/code/src/test.py app/code/src/featurework.py
+uv run python -m py_compile code/src/utils.py code/src/train.py code/src/predict.py code/src/lgb_branch.py code/src/portfolio_utils.py app/code/src/train.py app/code/src/test.py app/code/src/featurework.py
 uv run python app/code/src/train.py
 uv run python app/code/src/test.py
 uv run python test/score_self.py
@@ -431,16 +501,6 @@ bash test.sh
 ```
 
 注意：不要用裸 `py -3 app\code\src\train.py` 或裸 `python app/code/src/train.py` 跑训练，除非已经手动激活 `.venv`。裸命令可能调用系统 Python，导致找不到 `pandas`、`joblib` 或 `lightgbm`。
-
-## 方案主线
-
-最终方案保持三层结构。
-
-特征层：保留 baseline 的量价、技术指标和 Alpha 特征，新增横截面 rank、robust z-score、市场状态、相对强弱、流动性和风险特征。排序任务本质是同日横截面比较，所以这些特征优先级高于盲目扩大模型。
-
-模型层：保留 `StockTransformer` 作为可复现神经 baseline；加入 LightGBM Ranker / Regressor 双分支作为稳分底座；后续再加入动态相关图 GraphFormer，增强股票间结构建模。
-
-组合层：推理时不直接等权买入模型 Top5，而是按融合分数排序，再做 stable 候选过滤和当前 extreme risk_off 下的低复杂度流动性重排，最终 Top5 等权生成 `output/result.csv`。
 
 ## 已实现的关键改动
 
@@ -497,12 +557,13 @@ Phase 4/5 额外实现了 Top5-heavy LGBM ranker 诊断分支：
 
 推理端会对模型分数生成候选股票后执行：
 
-- 当前正式配置使用 `regime_liquidity_risk_off` 过滤。
-- 若当前横截面触发 extreme risk_off，则先取 `stable top30`，再按融合分数、流动性、短期动量、低波动和低振幅做二次重排。
+- 当前正式配置使用 `regime_liquidity_anchor_risk_off` 过滤。
+- 若当前横截面触发 extreme risk_off，则先取 `stable top60`，再按流动性锚定重排分数重排。
 - 若不触发 extreme risk_off，则回退普通 `stable` 过滤。
+- 然后执行 `branch_router_v2b` overlay：趋势增强 → 主题增强 → 补充 overlay → 追涨否决，最多替换 2 只。
 - 当前正式权重使用 `equal`，即 Top5 股票各 `0.2`，模型只负责排序和选股。
 - `risk_soft`、`score_soft`、`shrunk_softmax` 等非等权策略只作为 OOF 诊断候选；在未通过集中度和稳健性检查前，不写入正式 `predict.py`。
-- 当最新市场上涨家数比例过低时，代码支持将总仓位降到 `0.7`，但当前正式 exp-002-10-final 输出总仓位为 `1.0`。
+- 当最新市场上涨家数比例过低时（breadth < 0.30），代码支持将总仓位降到 `0.7`，但当前正式 exp-002-10-final 输出总仓位为 `1.0`。
 
 当前 risk_off 触发条件：
 
@@ -511,18 +572,6 @@ median ret20 < 0
 breadth20 < 0.45
 median sigma20 > 0.018
 dispersion20 > 0.10
-```
-
-当前 risk_off 重排分数：
-
-```text
-rerank_score =
-    0.30 * fused_score_z
-  + 0.30 * log_liquidity_z
-  + 0.10 * ret5_z
-  + 0.10 * ret20_z
-  - 0.05 * sigma20_z
-  - 0.15 * amp20_z
 ```
 
 提交前审核结果：
@@ -550,12 +599,24 @@ stock_id,weight
 │   ├── test.py           # 赛事推理入口，包装 code/src/predict.py
 │   └── featurework.py    # 赛事特征入口，导出 code/src/utils.py
 ├── code/src/
-│   ├── config.py         # 训练配置、缓存路径、融合权重
-│   ├── lgb_branch.py     # LightGBM Ranker / Regressor 分支
-│   ├── model.py          # StockTransformer baseline
+│   ├── config.py         # 训练配置、融合权重、branch_router_v2b/overlay 参数
+│   ├── model.py          # StockTransformer（含 CrossStockAttention）
 │   ├── train.py          # 训练主流程
-│   ├── predict.py        # 推理与组合权重生成
-│   └── utils.py          # 特征工程、样本构造
+│   ├── predict.py        # 推理主流程（GRR Top5 + regime 过滤 + overlay + 输出）
+│   ├── lgb_branch.py     # LightGBM Ranker / Regressor 分支
+│   ├── reranker.py       # RRF 多专家融合 + Hedge 路由 + Tail Guard 崩盘保护
+│   ├── branch_router.py  # branch_router_v1/v2a/v2b regime 感知路由
+│   ├── portfolio_utils.py# 过滤、配权、overlay、scorer-equivalent 评分工具
+│   ├── features.py       # 推理时风险特征构建（beta/波动率/回撤等）
+│   ├── feature_registry.py# 训练/推理统一特征注册与扩展
+│   ├── labels.py         # 标签构建（o2o_week / quality / relevance bins）
+│   ├── utils.py          # 样本构造、数据工具
+│   ├── experiment_blend.py# 融合权重/OOF 网格搜索（开发期诊断）
+│   ├── exp009_meta.py    # OOF bad-aware 元排名器（当前 disabled）
+│   ├── exp009_oof_builder.py# exp009 OOF 特征构建
+│   ├── exp009_runtime.py # exp009 运行时推理逻辑
+│   ├── stock_profile.py  # 个股画像/特征工具
+│   └── branch_router_diagnostics.py # 分支路由诊断
 ├── data/                 # train.csv / test.csv 等数据
 ├── model/                # 训练产物，默认不提交
 ├── output/               # result.csv，默认不提交
@@ -578,8 +639,6 @@ model/exp-002-05_60_158+39/
 ├── lgb_ranker.pkl
 ├── lgb_regressor.pkl
 ├── lgb_ranker_top5_v1.pkl      # 诊断分支，不默认启用
-├── lgb_ranker_top5_v2.pkl      # 诊断分支，不默认启用
-├── lgb_ranker_top5_v3.pkl      # 诊断分支，不默认启用
 ├── lgb_features.json
 ├── lgb_report.json
 └── log/
@@ -622,8 +681,8 @@ docker run --rm --gpus all --network none -v "$PWD/app/data:/app/data" -v "$PWD/
 
 ```csv
 stock_id,weight
-300274,0.2
 002384,0.2
+300274,0.2
 600015,0.2
 601077,0.2
 300750,0.2
