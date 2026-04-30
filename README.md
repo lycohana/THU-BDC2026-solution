@@ -1,6 +1,6 @@
 # THU-BDC2026 代码说明
 
-本项目为 THU-BDC2026 股票 Top5 选股/配权方案。最终推理入口生成 `output/result.csv`，格式为 `stock_id,weight`，最多 5 只股票，总权重不超过 1。当前正式推理数据为 `model/input/train_hs300_latest.csv`，历史行情截至 `2026-04-24`，用于给出下一交易日 `2026-04-27` 的 Top5 组合。该文件随模型一起放在非挂载目录中，避免官方复现时 `data/temp/output` 挂载覆盖。
+本项目为 THU-BDC2026 股票 Top5 选股/配权方案。最终推理入口生成 `output/result.csv`，格式为 `stock_id,weight`，最多 5 只股票，总权重不超过 1。当前正式推理数据为 `model/input/train_hs300_latest.csv`，历史行情截至 `2026-04-30`，用于给出五一假期后第一个交易日 `2026-05-06` 的 Top5 组合。该文件随模型一起放在非挂载目录中，避免官方复现时 `data/temp/output` 挂载覆盖。
 
 当前根目录 `readme.md` 面向代码审核、Docker 复现和最终提交准备。研发过程、实验流水账和 Todo 记录已移至 [docs/DEV_README.md](docs/DEV_README.md)。
 
@@ -24,7 +24,7 @@
 
 - `data/train.csv`：用于训练、验证、walk-forward OOF、融合权重和后处理策略选择。
 - `data/test.csv`：只用于固定规则后的最终推理和本地 `score_self.py` 记录，不用于调参、选模型、选股票或改权重。
-- `model/input/train_hs300_latest.csv`：正式推理输入，覆盖 `2024-01-02` 至 `2026-04-24` 的沪深300历史行情，用于生成 `2026-04-27` 组合。该文件放在非挂载目录，避免官方复现时 `data/temp/output` 挂载覆盖。
+- `model/input/train_hs300_latest.csv`：正式推理输入，覆盖 `2024-01-02` 至 `2026-04-30` 的沪深300历史行情，用于生成 `2026-05-06`（五一假期后第一个交易日）组合。该文件放在非挂载目录，避免官方复现时 `data/temp/output` 挂载覆盖。
 
 当前不使用任何外部公开数据、词典、embedding 或预训练模型，因此当前版本无需外部资源报备。若后续加入外部资源，必须满足开源时间和邮件报备要求，并在本文档补充链接、md5 和用途。
 
@@ -64,12 +64,14 @@
 
 #### 标签定义
 
-标签是未来第 1 到第 5 个交易日的开盘收益，与赛事 scorer 口径完全对齐：
+标签是未来第 1 到第 5 个交易日的开盘收益，与赛事 scorer 口径完全对齐。使用全局交易日列表索引（而非 per-stock groupby shift），避免缺失行导致标签错位。当 T+5 交易日因节假日缺失时，自动复用 T+4 数据：
 
 ```python
-open_t1 = groupby("股票代码")["开盘"].shift(-1)
-open_t5 = groupby("股票代码")["开盘"].shift(-5)
-label = (open_t5 - open_t1) / open_t1
+dates = sorted(df["日期"].dropna().unique())
+idx = dates.index(anchor_date)
+d1 = dates[idx + 1]       # T+1 开盘日
+dn = dates[min(idx + 5, len(dates) - 1)]  # T+5 开盘日，节假日复用 T+4
+label = (open[dn] - open[d1]) / open[d1]
 ```
 
 同时构建质量标签 `quality5`（可选扣除手续费、波动率和回撤惩罚）和离散化相关性分桶 `relevance5`（5 个分位），以及辅助短期标签 `aux1`、`aux3`。
@@ -174,10 +176,14 @@ GRR Top5 内置 `tail_guard` 模块，使用当日合法历史特征推断市场
 
 #### Supplemental Overlay（补充层）
 
-在 Trend/Theme overlay 之后，按优先级依次尝试两种补充策略（最多再替换 1 只，`supplemental_overlay_max_swaps=1`）：
+在 Trend/Theme overlay 之后，按优先级依次尝试以下补充策略（最多再替换 1 只，`supplemental_overlay_max_swaps=1`）：
 
-1. **riskoff_rank4_dynamic_defensive_target**：当 Top-5 中存在排名靠后的高风险标的时，用排名第 4 档的低风险防御型标的替换
-2. **pullback_rebound_highest_risk**：当市场处于短期回调但中期趋势仍在时，用回调反弹标的替换组合中风险最高的一只
+1. **deep_rebound_repair**：市场深度回撤（median_ret20 ≤ -5.5%，breadth20 ≤ 30%）时，用超跌反弹标的替换
+2. **growth_rrf_repair**：用 RRF 融合评分高的增长型标的修复低评分持仓
+3. **riskoff_fill_rank4_dynamic_defensive_target**：用排名第 4 档的低风险防御型标的替换高风险持仓（risk_delta ≤ 3%）
+4. **pullback_rebound_highest_risk**：短期回调但中期趋势仍在时，用回调反弹标的替换组合中风险最高的一只
+5. **cooldown_minrisk_repair**：市场冷却/反弹阶段时，用低风险标的替换
+6. **ret5_guarded_booster**：强动量标的（ret5 ≥ 8%，低风险）替换弱持仓
 
 #### Stress Chaser Veto（追涨否决）
 
@@ -185,6 +191,10 @@ GRR Top5 内置 `tail_guard` 模块，使用当日合法历史特征推断市场
 - `median_ret20 < 0` 且 `breadth20 < 0.50`
 - `median sigma20 > 0.018` 且 `dispersion20 > 0.10`
 - 最多替换 1 只被否决的追涨标的
+
+#### Anti-Lottery Overlay（反彩票过滤）
+
+在 supplementary overlay 之后执行，用反彩票评分（模型分 + 流动性 + 动量上限 + 跳空上限 - 风险分）过滤异常高波动/高跳空的"彩票型"标的，最多替换 1 只（`anti_lottery_rank_cap=1`）。
 
 ### 最终输出
 
@@ -233,7 +243,7 @@ bash test.sh
 
 主要步骤：
 
-1. 读取 `model/input/train_hs300_latest.csv`，取最新交易日 `2026-04-24` 作为推理基准日，输出下一交易日 `2026-04-27` 组合。
+1. 读取 `model/input/train_hs300_latest.csv`，取最新交易日 `2026-04-30` 作为推理基准日（五一假期前最后交易日），输出 `2026-05-06`（假期后第一个交易日）组合。如锚定日为周五，预测窗口为下一周周一至周五；节假日导致 T+5 交易日数据缺失时，复用 T+4 数据。
 2. 构造与训练一致的特征（约 270 维），并按 `scaler.feature_names_in_` 对齐；构造 60 日输入序列和风险特征帧。
 3. 加载 Transformer 产物，计算 Transformer 分数。
 4. 加载 LightGBM Ranker / Regressor 产物，计算 LGB 分数（rank 0.65 + reg 0.35）。
@@ -250,24 +260,37 @@ bash test.sh
 
 推理端支持缓存和 CUDA AMP：首轮生成 `temp/predict_artifacts_*.pkl`，重复推理可跳过重特征工程。
 
-当前正式输出示例：
+当前正式输出示例（2026-04-24 锚定，预测 2026-04-27~05-01 周）：
 
 ```csv
 stock_id,weight
-002384,0.2
-300274,0.2
-600015,0.2
-601077,0.2
-300750,0.2
+000408,0.2
+000977,0.2
+600584,0.2
+603893,0.2
+600150,0.2
 ```
 
-本地固定规则后记录分数：
+本地固定规则后记录分数（04-24~04-30 窗口，五一 T+5 复用 T+4）：
 
 ```text
-score_self.py = 0.12018139687305522
+score_self.py = 0.02388855740881048
 ```
 
-该分数为当前固定提交规则后的本地记录。`data/test.csv` 的未来收益只用于本地评分脚本记录，不进入模型训练、推理特征或提交逻辑。
+### 十窗周度回测
+
+使用 `scripts/batch_window_analysis.py --weekly` 进行周五锚点 → 下周 Mon-Fri 窗口回测（最近 10 个周五）：
+
+| Metric | 值 |
+|---|---|
+| mean | +2.19% |
+| median | +1.23% |
+| worst | -3.04% |
+| win_rate | 80% |
+
+各窗明细：`temp/batch_window_analysis/ten_window_weekly/window_summary.csv`
+
+`data/test.csv` 只用于固定规则后的最终推理和本地 `score_self.py` 记录，不用于调参、选模型、选股票或改权重。
 
 ## 常用命令
 

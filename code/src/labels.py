@@ -194,7 +194,7 @@ def realized_o2o_week_for_anchor(
     anchor = pd.Timestamp(anchor)
     idx = dates.index(anchor)
     d1 = pd.Timestamp(dates[idx + 1])
-    dn = pd.Timestamp(dates[idx + horizon])
+    dn = pd.Timestamp(dates[min(idx + horizon, len(dates) - 1)])
 
     open1 = data[data[date_col] == d1][[stock_col, open_col]].rename(
         columns={stock_col: 'stock_id', open_col: 'open_day1'}

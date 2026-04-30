@@ -65,7 +65,16 @@ def load_raw(path: Path) -> pd.DataFrame:
 def parse_anchor_args(args: argparse.Namespace, dates: list[pd.Timestamp]) -> list[pd.Timestamp]:
     label_horizon = int(args.label_horizon)
     min_idx = int(args.min_history_days) - 1
-    max_idx = len(dates) - 1 - label_horizon
+    max_idx = len(dates) - label_horizon
+
+    if args.weekly:
+        assert not args.anchors, "--weekly does not combine with --anchors"
+        assert not args.step or args.step == 5, "--weekly overrides --step"
+        allowed = [d for d in dates[min_idx:max_idx + 1] if d.weekday() == 4]
+        if args.last_n:
+            allowed = allowed[-int(args.last_n):]
+        return allowed
+
     allowed = dates[min_idx : max_idx + 1]
 
     if args.anchors:
@@ -984,6 +993,7 @@ def main() -> None:
     parser.add_argument("--end-anchor", default=None)
     parser.add_argument("--last-n", type=int, default=8)
     parser.add_argument("--step", type=int, default=5)
+    parser.add_argument("--weekly", action="store_true", help="Use Fridays as anchors, evaluating the next Mon-Fri week")
     parser.add_argument("--min-history-days", type=int, default=80)
     parser.add_argument("--label-horizon", type=int, default=5)
     parser.add_argument("--model-dir", default=None)
